@@ -32,8 +32,10 @@ FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libavformat61 \
     libavcodec61 \
+    libavdevice61 \
+    libavfilter10 \
+    libavformat61 \
     libavutil59 \
     libswresample5 \
     libswscale8 \
