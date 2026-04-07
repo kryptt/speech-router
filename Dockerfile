@@ -28,15 +28,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git \
     cargo test -- --test-threads=1
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libavformat59 \
-    libavcodec59 \
-    libavutil57 \
-    libswresample4 \
-    libswscale6 \
+    libavformat61 \
+    libavcodec61 \
+    libavutil59 \
+    libswresample5 \
+    libswscale8 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/speech-router /speech-router
