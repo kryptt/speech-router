@@ -171,6 +171,68 @@ fn copy_into(dst: &mut &mut [u8], src: &[u8]) {
 // Info / describe response
 // ---------------------------------------------------------------------------
 
+/// Build the TTS voice list for the Wyoming info event.
+///
+/// Includes all Kokoro English voices (US + GB). The default voice is listed
+/// first so Home Assistant selects it automatically.
+fn tts_voices(default_voice: &str) -> serde_json::Value {
+    const KOKORO_VOICES: &[(&str, &str, &str)] = &[
+        ("af_heart",   "en", "Heart (F, US)"),
+        ("af_alloy",   "en", "Alloy (F, US)"),
+        ("af_aoede",   "en", "Aoede (F, US)"),
+        ("af_bella",   "en", "Bella (F, US)"),
+        ("af_jessica",  "en", "Jessica (F, US)"),
+        ("af_kore",    "en", "Kore (F, US)"),
+        ("af_nicole",  "en", "Nicole (F, US)"),
+        ("af_nova",    "en", "Nova (F, US)"),
+        ("af_river",   "en", "River (F, US)"),
+        ("af_sarah",   "en", "Sarah (F, US)"),
+        ("af_sky",     "en", "Sky (F, US)"),
+        ("am_adam",    "en", "Adam (M, US)"),
+        ("am_echo",    "en", "Echo (M, US)"),
+        ("am_eric",    "en", "Eric (M, US)"),
+        ("am_fenrir",  "en", "Fenrir (M, US)"),
+        ("am_liam",    "en", "Liam (M, US)"),
+        ("am_michael", "en", "Michael (M, US)"),
+        ("am_onyx",    "en", "Onyx (M, US)"),
+        ("am_puck",    "en", "Puck (M, US)"),
+        ("bf_alice",   "en", "Alice (F, GB)"),
+        ("bf_emma",    "en", "Emma (F, GB)"),
+        ("bf_isabella","en", "Isabella (F, GB)"),
+        ("bf_lily",    "en", "Lily (F, GB)"),
+        ("bm_daniel",  "en", "Daniel (M, GB)"),
+        ("bm_fable",   "en", "Fable (M, GB)"),
+        ("bm_george",  "en", "George (M, GB)"),
+        ("bm_lewis",   "en", "Lewis (M, GB)"),
+    ];
+
+    let attr = serde_json::json!({
+        "name": "Kokoro",
+        "url": "https://github.com/hexgrad/kokoro"
+    });
+
+    // Put the default voice first so HA auto-selects it.
+    let mut voices: Vec<serde_json::Value> = Vec::with_capacity(KOKORO_VOICES.len());
+    let mut rest: Vec<serde_json::Value> = Vec::new();
+
+    for &(name, lang, desc) in KOKORO_VOICES {
+        let v = serde_json::json!({
+            "name": name,
+            "description": desc,
+            "installed": true,
+            "languages": [lang],
+            "attribution": attr,
+        });
+        if name == default_voice {
+            voices.insert(0, v);
+        } else {
+            rest.push(v);
+        }
+    }
+    voices.append(&mut rest);
+    serde_json::Value::Array(voices)
+}
+
 fn info_event(config: &Config) -> Event {
     let info = serde_json::json!({
         "asr": [{
@@ -194,22 +256,13 @@ fn info_event(config: &Config) -> Event {
         }],
         "tts": [{
             "name": "speaches-tts",
-            "description": "Speaches TTS",
+            "description": "Speaches TTS (Kokoro)",
             "installed": true,
             "attribution": {
-                "name": "speaches",
-                "url": "https://speaches.ai"
+                "name": "Kokoro",
+                "url": "https://github.com/hexgrad/kokoro"
             },
-            "voices": [{
-                "name": config.default_tts_voice,
-                "description": format!("{} voice", config.default_tts_voice),
-                "installed": true,
-                "languages": ["en"],
-                "attribution": {
-                    "name": "speaches",
-                    "url": "https://speaches.ai"
-                }
-            }]
+            "voices": tts_voices(&config.default_tts_voice)
         }]
     });
 
@@ -299,7 +352,7 @@ async fn finish_stt(
 // TTS handler
 // ---------------------------------------------------------------------------
 
-const TTS_SAMPLE_RATE: u32 = 22050;
+const TTS_SAMPLE_RATE: u32 = 24000;
 const TTS_WIDTH: u16 = 2;
 const TTS_CHANNELS: u16 = 1;
 const TTS_CHUNK_SIZE: usize = 8192;
