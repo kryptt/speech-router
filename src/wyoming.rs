@@ -172,18 +172,30 @@ fn info_event(config: &Config) -> Event {
                 "name": config.default_model,
                 "description": format!("Faster Whisper {}", config.default_model),
                 "installed": true,
-                "languages": ["en", "es", "fr", "de", "nl"]
+                "languages": ["en", "es", "fr", "de", "nl"],
+                "attribution": {
+                    "name": "speaches",
+                    "url": "https://speaches.ai"
+                }
             }]
         }],
         "tts": [{
             "name": "speaches-tts",
             "description": "Speaches TTS",
             "installed": true,
+            "attribution": {
+                "name": "speaches",
+                "url": "https://speaches.ai"
+            },
             "models": [{
                 "name": config.default_tts_model,
                 "description": format!("{} TTS", config.default_tts_model),
                 "installed": true,
-                "languages": ["en"]
+                "languages": ["en"],
+                "attribution": {
+                    "name": "speaches",
+                    "url": "https://speaches.ai"
+                }
             }]
         }]
     });
