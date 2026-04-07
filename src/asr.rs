@@ -588,13 +588,16 @@ async fn extract_video_audio_track(
     video_path: &Path,
     track: Option<u32>,
 ) -> Result<AudioFile, Response> {
-    let named = tempfile::NamedTempFile::new().map_err(|e| {
-        tracing::warn!(error = %e, "failed to create temp file for video audio extraction");
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to create temp file",
-        )
-    })?;
+    let named = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| {
+            tracing::warn!(error = %e, "failed to create temp file for video audio extraction");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create temp file",
+            )
+        })?;
     let wav_path = named.into_temp_path();
 
     let vp = video_path.to_path_buf();
@@ -663,7 +666,9 @@ async fn detect_language_from_file(
         let audio_path = audio_path.to_path_buf();
 
         handles.push(tokio::spawn(async move {
-            let named = tempfile::NamedTempFile::new()
+            let named = tempfile::Builder::new()
+                .suffix(".wav")
+                .tempfile()
                 .map_err(|e| format!("temp file creation failed: {e}"))?;
             let segment_path = named.into_temp_path();
 
@@ -838,10 +843,13 @@ async fn wrap_raw_pcm_as_wav(audio: AudioFile) -> Result<AudioFile, Response> {
 
     let header = wav_header(pcm_len as u32, 16_000, 1, 2);
 
-    let named = tempfile::NamedTempFile::new().map_err(|e| {
-        tracing::warn!(error = %e, "failed to create WAV temp file");
-        error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to create temp file")
-    })?;
+    let named = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| {
+            tracing::warn!(error = %e, "failed to create WAV temp file");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to create temp file")
+        })?;
     let wav_path = named.into_temp_path();
 
     let mut out = tokio::fs::File::create(&wav_path).await.map_err(|e| {
