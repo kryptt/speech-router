@@ -91,6 +91,7 @@ async fn main() {
     let asr_router: Router<()> = Router::new()
         .route("/asr", post(asr::handle_asr))
         .route("/detect-language", post(asr::handle_detect_language))
+        .route("/status", get(status_route))
         .with_state(asr_state);
 
     let passthrough_router: Router<()> = Router::new()
@@ -200,6 +201,14 @@ async fn health_route(State(state): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+async fn status_route() -> Response {
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+    )
+        .into_response()
 }
 
 async fn metrics_route(State(state): State<AppState>) -> Response {
