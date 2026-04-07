@@ -824,13 +824,19 @@ async fn extract_audio_file(mut multipart: Multipart) -> Result<AudioFile, Respo
 /// Wrap raw 16-bit signed-integer PCM (16 kHz, mono) in a WAV container so
 /// that Speaches can decode it.  Returns a new [`AudioFile`] backed by a fresh
 /// temp file.
+///
+/// Streams the PCM data from the source file to the output file without loading
+/// the entire payload into memory (raw PCM for a movie can exceed 200 MB).
 async fn wrap_raw_pcm_as_wav(audio: AudioFile) -> Result<AudioFile, Response> {
-    let pcm = tokio::fs::read(&audio.temp_path).await.map_err(|e| {
-        tracing::warn!(error = %e, "failed to read raw PCM temp file");
-        error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
-    })?;
+    let pcm_len = tokio::fs::metadata(&audio.temp_path)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "failed to stat raw PCM temp file");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
+        })?
+        .len();
 
-    let header = wav_header(pcm.len() as u32, 16_000, 1, 2);
+    let header = wav_header(pcm_len as u32, 16_000, 1, 2);
 
     let named = tempfile::NamedTempFile::new().map_err(|e| {
         tracing::warn!(error = %e, "failed to create WAV temp file");
@@ -846,10 +852,16 @@ async fn wrap_raw_pcm_as_wav(audio: AudioFile) -> Result<AudioFile, Response> {
         tracing::warn!(error = %e, "failed to write WAV header");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
     })?;
-    out.write_all(&pcm).await.map_err(|e| {
-        tracing::warn!(error = %e, "failed to write PCM data");
+
+    let mut src = tokio::fs::File::open(&audio.temp_path).await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to open raw PCM temp file");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
     })?;
+    tokio::io::copy(&mut src, &mut out).await.map_err(|e| {
+        tracing::warn!(error = %e, "failed to copy PCM data");
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
+    })?;
+
     out.flush().await.map_err(|e| {
         tracing::warn!(error = %e, "failed to flush WAV temp file");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
