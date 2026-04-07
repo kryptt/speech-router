@@ -12,15 +12,27 @@ use crate::config::Config;
 // Wire types
 // ---------------------------------------------------------------------------
 
+/// Helper for `skip_serializing_if` on zero-valued lengths.
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
 /// Header line that precedes every Wyoming event on the wire.
+///
+/// The official Python reference may send additional fields (e.g. `version`).
+/// Unknown fields are tolerated via `deny_unknown_fields` being absent.
+/// Zero-valued `data_length` and `payload_length` are omitted on the wire,
+/// matching the Python implementation behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventHeader {
     #[serde(rename = "type")]
     pub event_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub data_length: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub payload_length: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// A fully parsed Wyoming event: header + optional JSON data + optional binary
@@ -98,6 +110,7 @@ fn make_event(event_type: &str, data: Option<&serde_json::Value>, payload: &[u8]
             event_type: event_type.to_string(),
             data_length: data_bytes.len(),
             payload_length: payload.len(),
+            version: Some("1.0.0".to_string()),
         },
         data: data_bytes,
         payload: payload.to_vec(),
@@ -187,9 +200,9 @@ fn info_event(config: &Config) -> Event {
                 "name": "speaches",
                 "url": "https://speaches.ai"
             },
-            "models": [{
-                "name": config.default_tts_model,
-                "description": format!("{} TTS", config.default_tts_model),
+            "voices": [{
+                "name": config.default_tts_voice,
+                "description": format!("{} voice", config.default_tts_voice),
                 "installed": true,
                 "languages": ["en"],
                 "attribution": {
@@ -593,6 +606,7 @@ mod tests {
         assert_eq!(header.event_type, "describe");
         assert_eq!(header.data_length, 0);
         assert_eq!(header.payload_length, 0);
+        assert_eq!(header.version, None);
     }
 
     #[test]
@@ -601,6 +615,7 @@ mod tests {
             event_type: "transcript".to_string(),
             data_length: 42,
             payload_length: 100,
+            version: None,
         };
         let json = serde_json::to_string(&header).unwrap();
         // Verify it round-trips
@@ -619,6 +634,46 @@ mod tests {
         assert_eq!(header.payload_length, 8192);
     }
 
+    #[test]
+    fn event_header_tolerates_unknown_fields() {
+        // The Python reference sends a "version" field; our struct must not
+        // reject unknown keys.
+        let json = r#"{"type":"describe","version":"1.8.0"}"#;
+        let header: EventHeader = serde_json::from_str(json).unwrap();
+        assert_eq!(header.event_type, "describe");
+        assert_eq!(header.data_length, 0);
+        assert_eq!(header.payload_length, 0);
+        assert_eq!(header.version, Some("1.8.0".to_string()));
+    }
+
+    #[test]
+    fn event_header_omits_zero_lengths() {
+        let header = EventHeader {
+            event_type: "describe".to_string(),
+            data_length: 0,
+            payload_length: 0,
+            version: None,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("data_length").is_none(), "zero data_length should be omitted");
+        assert!(parsed.get("payload_length").is_none(), "zero payload_length should be omitted");
+    }
+
+    #[test]
+    fn event_header_includes_nonzero_lengths() {
+        let header = EventHeader {
+            event_type: "audio-chunk".to_string(),
+            data_length: 42,
+            payload_length: 100,
+            version: None,
+        };
+        let json = serde_json::to_string(&header).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["data_length"], 42);
+        assert_eq!(parsed["payload_length"], 100);
+    }
+
     // -- Event round-trip test --
 
     #[tokio::test]
@@ -628,6 +683,7 @@ mod tests {
                 event_type: "audio-chunk".to_string(),
                 data_length: 13,
                 payload_length: 4,
+                version: Some("1.0.0".to_string()),
             },
             data: br#"{"rate":16000}"#[..13].to_vec(),
             payload: vec![0x01, 0x02, 0x03, 0x04],
@@ -682,5 +738,100 @@ mod tests {
         let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
         let result = read_event(&mut reader).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn describe_event_minimal() {
+        let wire = b"{\"type\":\"describe\"}\n";
+        let mut reader = BufReader::new(Cursor::new(wire.to_vec()));
+        let event = read_event(&mut reader).await.unwrap().unwrap();
+        assert_eq!(event.header.event_type, "describe");
+        assert!(event.data.is_empty());
+        assert!(event.payload.is_empty());
+    }
+
+    fn test_config() -> Config {
+        Config {
+            speaches_url: "http://localhost:8080".to_string(),
+            public_addr: "0.0.0.0:8000".parse().unwrap(),
+            wyoming_port: 10300,
+            internal_addr: "0.0.0.0:9090".parse().unwrap(),
+            default_model: "large-v3-turbo".to_string(),
+            default_tts_model: "kokoro".to_string(),
+            default_tts_voice: "af_heart".to_string(),
+        }
+    }
+
+    #[test]
+    fn info_event_has_required_fields() {
+        let config = test_config();
+        let event = info_event(&config);
+        let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
+
+        // ASR program
+        let asr = &data["asr"][0];
+        assert!(asr.get("name").is_some(), "asr must have name");
+        assert!(asr["attribution"].get("name").is_some(), "asr must have attribution.name");
+        assert!(asr["attribution"].get("url").is_some(), "asr must have attribution.url");
+        assert!(asr.get("installed").is_some(), "asr must have installed");
+        assert!(asr.get("models").is_some(), "asr must have models");
+
+        let asr_model = &asr["models"][0];
+        assert!(asr_model.get("name").is_some(), "asr model must have name");
+        assert!(asr_model.get("attribution").is_some(), "asr model must have attribution");
+        assert!(asr_model.get("installed").is_some(), "asr model must have installed");
+        assert!(asr_model.get("languages").is_some(), "asr model must have languages");
+
+        // TTS program — must use "voices", not "models"
+        let tts = &data["tts"][0];
+        assert!(tts.get("name").is_some(), "tts must have name");
+        assert!(tts["attribution"].get("name").is_some(), "tts must have attribution.name");
+        assert!(tts["attribution"].get("url").is_some(), "tts must have attribution.url");
+        assert!(tts.get("installed").is_some(), "tts must have installed");
+        assert!(tts.get("voices").is_some(), "tts must have voices (not models)");
+        assert!(tts.get("models").is_none(), "tts must NOT have models key");
+
+        let tts_voice = &tts["voices"][0];
+        assert!(tts_voice.get("name").is_some(), "tts voice must have name");
+        assert!(tts_voice.get("attribution").is_some(), "tts voice must have attribution");
+        assert!(tts_voice.get("installed").is_some(), "tts voice must have installed");
+        assert!(tts_voice.get("languages").is_some(), "tts voice must have languages");
+    }
+
+    #[tokio::test]
+    async fn info_event_roundtrip_compatible() {
+        let config = test_config();
+        let original = info_event(&config);
+
+        // Write to wire format
+        let mut buf = Vec::new();
+        write_event(&mut buf, &original).await.unwrap();
+
+        // Read back
+        let mut reader = BufReader::new(Cursor::new(buf));
+        let restored = read_event(&mut reader).await.unwrap().unwrap();
+
+        assert_eq!(restored.header.event_type, "info");
+        assert_eq!(restored.data.len(), original.data.len());
+        assert_eq!(restored.payload.len(), original.payload.len());
+
+        // Verify JSON data survived the round trip
+        let original_data: serde_json::Value = serde_json::from_slice(&original.data).unwrap();
+        let restored_data: serde_json::Value = serde_json::from_slice(&restored.data).unwrap();
+        assert_eq!(original_data, restored_data);
+    }
+
+    #[tokio::test]
+    async fn event_with_version_field() {
+        let event = make_event("test", None, &[]);
+
+        let mut buf = Vec::new();
+        write_event(&mut buf, &event).await.unwrap();
+
+        // The first line is the header JSON
+        let wire = String::from_utf8(buf).unwrap();
+        let header_line = wire.lines().next().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(header_line).unwrap();
+        assert_eq!(parsed["version"], "1.0.0", "written events must include version field");
     }
 }
