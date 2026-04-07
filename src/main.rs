@@ -4,6 +4,7 @@ use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get, post};
 use axum::Router;
 use prometheus_client::registry::Registry;
@@ -92,6 +93,7 @@ async fn main() {
         .route("/asr", post(asr::handle_asr))
         .route("/detect-language", post(asr::handle_detect_language))
         .route("/status", get(status_route))
+        .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GiB — raw PCM of full movies
         .with_state(asr_state);
 
     let passthrough_router: Router<()> = Router::new()
