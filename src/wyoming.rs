@@ -17,7 +17,9 @@ use crate::config::Config;
 pub struct EventHeader {
     #[serde(rename = "type")]
     pub event_type: String,
+    #[serde(default)]
     pub data_length: usize,
+    #[serde(default)]
     pub payload_length: usize,
 }
 
