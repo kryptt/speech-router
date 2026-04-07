@@ -63,9 +63,6 @@ async fn main() {
             .expect("failed to build HTTP client"),
     );
 
-    // Ensure required models are downloaded in Speaches.
-    ensure_models(&config, &client).await;
-
     let mut registry = Registry::default();
     let metrics = Arc::new(Metrics::new(&mut registry));
 
@@ -134,80 +131,6 @@ async fn main() {
     }
     if let Err(e) = r2 {
         tracing::error!(error = %e, "internal server error");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Shutdown
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Model provisioning
-// ---------------------------------------------------------------------------
-
-/// Wait for Speaches to become healthy, then ensure each required model is
-/// installed.  Models that are already present are skipped.  This runs at
-/// startup so the pod is fully functional before accepting traffic.
-async fn ensure_models(config: &Config, client: &reqwest::Client) {
-    let models = [&config.default_model, &config.default_tts_model];
-
-    // Speaches (sidecar) may still be starting — retry health check.
-    let health_url = format!("{}/health", config.speaches_url);
-    for attempt in 1..=60 {
-        match client.get(&health_url).send().await {
-            Ok(r) if r.status().is_success() => break,
-            _ => {
-                if attempt == 60 {
-                    tracing::error!("speaches not healthy after 60 attempts, giving up on model provisioning");
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-    }
-
-    // Check which models are already installed.
-    let models_url = format!("{}/v1/models", config.speaches_url);
-    let installed: Vec<String> = match client.get(&models_url).send().await {
-        Ok(resp) => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| {
-                v["data"]
-                    .as_array()?
-                    .iter()
-                    .map(|m| m["id"].as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to list models, will attempt downloads anyway");
-            Vec::new()
-        }
-    };
-
-    for model in models {
-        if installed.iter().any(|id| id == model) {
-            info!(model, "model already installed");
-            continue;
-        }
-
-        let url = format!("{}/v1/models/{}", config.speaches_url, model);
-        info!(model, "downloading model");
-        match client.post(&url).send().await {
-            Ok(r) if r.status().is_success() => {
-                info!(model, "model downloaded");
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                tracing::error!(model, %status, body, "model download failed");
-            }
-            Err(e) => {
-                tracing::error!(model, error = %e, "model download request failed");
-            }
-        }
     }
 }
 
