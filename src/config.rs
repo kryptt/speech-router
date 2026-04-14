@@ -17,8 +17,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let speaches_url = env::var("SPEACHES_URL")
-            .map_err(|_| ConfigError::MissingRequired("SPEACHES_URL"))?;
+        let speaches_url =
+            env::var("SPEACHES_URL").map_err(|_| ConfigError::MissingRequired("SPEACHES_URL"))?;
 
         if speaches_url.is_empty() {
             return Err(ConfigError::MissingRequired("SPEACHES_URL"));
@@ -30,12 +30,12 @@ impl Config {
         let wyoming_port = parse_env_u16("WYOMING_PORT", 10300)?;
         let internal_port = parse_env_u16("INTERNAL_PORT", 9090)?;
 
-        let default_model = env::var("DEFAULT_MODEL")
-            .unwrap_or_else(|_| "large-v3-turbo".to_string());
-        let default_tts_model = env::var("DEFAULT_TTS_MODEL")
-            .unwrap_or_else(|_| "kokoro".to_string());
-        let default_tts_voice = env::var("DEFAULT_TTS_VOICE")
-            .unwrap_or_else(|_| "af_heart".to_string());
+        let default_model =
+            env::var("DEFAULT_MODEL").unwrap_or_else(|_| "large-v3-turbo".to_string());
+        let default_tts_model =
+            env::var("DEFAULT_TTS_MODEL").unwrap_or_else(|_| "kokoro".to_string());
+        let default_tts_voice =
+            env::var("DEFAULT_TTS_VOICE").unwrap_or_else(|_| "af_heart".to_string());
 
         Ok(Config {
             speaches_url,
@@ -89,10 +89,8 @@ mod tests {
     /// Tests are run single-threaded (`cargo test -- --test-threads=1` in CI)
     /// so concurrent env mutation is not a concern.
     fn with_env<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
-        let originals: Vec<(&str, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| (*k, env::var(k).ok()))
-            .collect();
+        let originals: Vec<(&str, Option<String>)> =
+            vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
 
         for (k, v) in vars {
             // SAFETY: tests run single-threaded; no concurrent env readers.
@@ -177,10 +175,19 @@ mod tests {
     #[test]
     fn invalid_port_is_error() {
         with_env(
-            &[("SPEACHES_URL", "http://x:1"), ("PUBLIC_PORT", "not_a_number")],
+            &[
+                ("SPEACHES_URL", "http://x:1"),
+                ("PUBLIC_PORT", "not_a_number"),
+            ],
             || {
                 let err = Config::from_env().unwrap_err();
-                assert!(matches!(err, ConfigError::InvalidValue { key: "PUBLIC_PORT", .. }));
+                assert!(matches!(
+                    err,
+                    ConfigError::InvalidValue {
+                        key: "PUBLIC_PORT",
+                        ..
+                    }
+                ));
             },
         );
     }

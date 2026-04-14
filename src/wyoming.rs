@@ -81,7 +81,10 @@ async fn read_event<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> std::io::Resu
 }
 
 /// Write one Wyoming event to a stream.
-async fn write_event<W: AsyncWriteExt + Unpin>(writer: &mut W, event: &Event) -> std::io::Result<()> {
+async fn write_event<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    event: &Event,
+) -> std::io::Result<()> {
     let header_json = serde_json::to_string(&event.header)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -177,33 +180,33 @@ fn copy_into(dst: &mut &mut [u8], src: &[u8]) {
 /// first so Home Assistant selects it automatically.
 fn tts_voices(default_voice: &str) -> serde_json::Value {
     const KOKORO_VOICES: &[(&str, &str, &str)] = &[
-        ("af_heart",   "en", "Heart (F, US)"),
-        ("af_alloy",   "en", "Alloy (F, US)"),
-        ("af_aoede",   "en", "Aoede (F, US)"),
-        ("af_bella",   "en", "Bella (F, US)"),
-        ("af_jessica",  "en", "Jessica (F, US)"),
-        ("af_kore",    "en", "Kore (F, US)"),
-        ("af_nicole",  "en", "Nicole (F, US)"),
-        ("af_nova",    "en", "Nova (F, US)"),
-        ("af_river",   "en", "River (F, US)"),
-        ("af_sarah",   "en", "Sarah (F, US)"),
-        ("af_sky",     "en", "Sky (F, US)"),
-        ("am_adam",    "en", "Adam (M, US)"),
-        ("am_echo",    "en", "Echo (M, US)"),
-        ("am_eric",    "en", "Eric (M, US)"),
-        ("am_fenrir",  "en", "Fenrir (M, US)"),
-        ("am_liam",    "en", "Liam (M, US)"),
+        ("af_heart", "en", "Heart (F, US)"),
+        ("af_alloy", "en", "Alloy (F, US)"),
+        ("af_aoede", "en", "Aoede (F, US)"),
+        ("af_bella", "en", "Bella (F, US)"),
+        ("af_jessica", "en", "Jessica (F, US)"),
+        ("af_kore", "en", "Kore (F, US)"),
+        ("af_nicole", "en", "Nicole (F, US)"),
+        ("af_nova", "en", "Nova (F, US)"),
+        ("af_river", "en", "River (F, US)"),
+        ("af_sarah", "en", "Sarah (F, US)"),
+        ("af_sky", "en", "Sky (F, US)"),
+        ("am_adam", "en", "Adam (M, US)"),
+        ("am_echo", "en", "Echo (M, US)"),
+        ("am_eric", "en", "Eric (M, US)"),
+        ("am_fenrir", "en", "Fenrir (M, US)"),
+        ("am_liam", "en", "Liam (M, US)"),
         ("am_michael", "en", "Michael (M, US)"),
-        ("am_onyx",    "en", "Onyx (M, US)"),
-        ("am_puck",    "en", "Puck (M, US)"),
-        ("bf_alice",   "en", "Alice (F, GB)"),
-        ("bf_emma",    "en", "Emma (F, GB)"),
-        ("bf_isabella","en", "Isabella (F, GB)"),
-        ("bf_lily",    "en", "Lily (F, GB)"),
-        ("bm_daniel",  "en", "Daniel (M, GB)"),
-        ("bm_fable",   "en", "Fable (M, GB)"),
-        ("bm_george",  "en", "George (M, GB)"),
-        ("bm_lewis",   "en", "Lewis (M, GB)"),
+        ("am_onyx", "en", "Onyx (M, US)"),
+        ("am_puck", "en", "Puck (M, US)"),
+        ("bf_alice", "en", "Alice (F, GB)"),
+        ("bf_emma", "en", "Emma (F, GB)"),
+        ("bf_isabella", "en", "Isabella (F, GB)"),
+        ("bf_lily", "en", "Lily (F, GB)"),
+        ("bm_daniel", "en", "Daniel (M, GB)"),
+        ("bm_fable", "en", "Fable (M, GB)"),
+        ("bm_george", "en", "George (M, GB)"),
+        ("bm_lewis", "en", "Lewis (M, GB)"),
     ];
 
     let attr = serde_json::json!({
@@ -550,9 +553,7 @@ async fn handle_connection(stream: TcpStream, config: Arc<Config>, client: Arc<r
                     (text, voice)
                 };
 
-                if let Err(e) =
-                    handle_tts(&mut write_half, &text, &voice, &config, &client).await
-                {
+                if let Err(e) = handle_tts(&mut write_half, &text, &voice, &config, &client).await {
                     warn!(%addr, error = %e, "TTS synthesis failed");
                 }
             }
@@ -709,8 +710,14 @@ mod tests {
         };
         let json = serde_json::to_string(&header).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("data_length").is_none(), "zero data_length should be omitted");
-        assert!(parsed.get("payload_length").is_none(), "zero payload_length should be omitted");
+        assert!(
+            parsed.get("data_length").is_none(),
+            "zero data_length should be omitted"
+        );
+        assert!(
+            parsed.get("payload_length").is_none(),
+            "zero payload_length should be omitted"
+        );
     }
 
     #[test]
@@ -824,31 +831,64 @@ mod tests {
         // ASR program
         let asr = &data["asr"][0];
         assert!(asr.get("name").is_some(), "asr must have name");
-        assert!(asr["attribution"].get("name").is_some(), "asr must have attribution.name");
-        assert!(asr["attribution"].get("url").is_some(), "asr must have attribution.url");
+        assert!(
+            asr["attribution"].get("name").is_some(),
+            "asr must have attribution.name"
+        );
+        assert!(
+            asr["attribution"].get("url").is_some(),
+            "asr must have attribution.url"
+        );
         assert!(asr.get("installed").is_some(), "asr must have installed");
         assert!(asr.get("models").is_some(), "asr must have models");
 
         let asr_model = &asr["models"][0];
         assert!(asr_model.get("name").is_some(), "asr model must have name");
-        assert!(asr_model.get("attribution").is_some(), "asr model must have attribution");
-        assert!(asr_model.get("installed").is_some(), "asr model must have installed");
-        assert!(asr_model.get("languages").is_some(), "asr model must have languages");
+        assert!(
+            asr_model.get("attribution").is_some(),
+            "asr model must have attribution"
+        );
+        assert!(
+            asr_model.get("installed").is_some(),
+            "asr model must have installed"
+        );
+        assert!(
+            asr_model.get("languages").is_some(),
+            "asr model must have languages"
+        );
 
         // TTS program — must use "voices", not "models"
         let tts = &data["tts"][0];
         assert!(tts.get("name").is_some(), "tts must have name");
-        assert!(tts["attribution"].get("name").is_some(), "tts must have attribution.name");
-        assert!(tts["attribution"].get("url").is_some(), "tts must have attribution.url");
+        assert!(
+            tts["attribution"].get("name").is_some(),
+            "tts must have attribution.name"
+        );
+        assert!(
+            tts["attribution"].get("url").is_some(),
+            "tts must have attribution.url"
+        );
         assert!(tts.get("installed").is_some(), "tts must have installed");
-        assert!(tts.get("voices").is_some(), "tts must have voices (not models)");
+        assert!(
+            tts.get("voices").is_some(),
+            "tts must have voices (not models)"
+        );
         assert!(tts.get("models").is_none(), "tts must NOT have models key");
 
         let tts_voice = &tts["voices"][0];
         assert!(tts_voice.get("name").is_some(), "tts voice must have name");
-        assert!(tts_voice.get("attribution").is_some(), "tts voice must have attribution");
-        assert!(tts_voice.get("installed").is_some(), "tts voice must have installed");
-        assert!(tts_voice.get("languages").is_some(), "tts voice must have languages");
+        assert!(
+            tts_voice.get("attribution").is_some(),
+            "tts voice must have attribution"
+        );
+        assert!(
+            tts_voice.get("installed").is_some(),
+            "tts voice must have installed"
+        );
+        assert!(
+            tts_voice.get("languages").is_some(),
+            "tts voice must have languages"
+        );
     }
 
     #[tokio::test]
@@ -885,6 +925,9 @@ mod tests {
         let wire = String::from_utf8(buf).unwrap();
         let header_line = wire.lines().next().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(header_line).unwrap();
-        assert_eq!(parsed["version"], "1.0.0", "written events must include version field");
+        assert_eq!(
+            parsed["version"], "1.0.0",
+            "written events must include version field"
+        );
     }
 }

@@ -244,7 +244,12 @@ fn transcode_audio(
                 output_pts += resampled.samples() as i64;
 
                 encoder.send_frame(&resampled)?;
-                receive_and_write_packets(&mut encoder, &mut output_ctx, out_stream_index, out_time_base)?;
+                receive_and_write_packets(
+                    &mut encoder,
+                    &mut output_ctx,
+                    out_stream_index,
+                    out_time_base,
+                )?;
             }
         }
     }
@@ -259,7 +264,12 @@ fn transcode_audio(
             output_pts += resampled.samples() as i64;
 
             encoder.send_frame(&resampled)?;
-            receive_and_write_packets(&mut encoder, &mut output_ctx, out_stream_index, out_time_base)?;
+            receive_and_write_packets(
+                &mut encoder,
+                &mut output_ctx,
+                out_stream_index,
+                out_time_base,
+            )?;
         }
     }
 
@@ -272,7 +282,12 @@ fn transcode_audio(
             output_pts += resampled.samples() as i64;
 
             encoder.send_frame(&resampled)?;
-            receive_and_write_packets(&mut encoder, &mut output_ctx, out_stream_index, out_time_base)?;
+            receive_and_write_packets(
+                &mut encoder,
+                &mut output_ctx,
+                out_stream_index,
+                out_time_base,
+            )?;
         }
         if delay.is_none() {
             break;
@@ -281,7 +296,12 @@ fn transcode_audio(
 
     // Flush encoder.
     encoder.send_eof()?;
-    receive_and_write_packets(&mut encoder, &mut output_ctx, out_stream_index, out_time_base)?;
+    receive_and_write_packets(
+        &mut encoder,
+        &mut output_ctx,
+        out_stream_index,
+        out_time_base,
+    )?;
 
     output_ctx.write_trailer()?;
 
@@ -315,7 +335,11 @@ fn receive_and_write_packets(
 ///
 /// Returns `num_samples` offsets distributed uniformly. If the total duration
 /// is shorter than `sample_duration`, returns a single offset at 0.0.
-pub(crate) fn sample_offsets(total_duration: f64, num_samples: usize, sample_duration: f64) -> Vec<f64> {
+pub(crate) fn sample_offsets(
+    total_duration: f64,
+    num_samples: usize,
+    sample_duration: f64,
+) -> Vec<f64> {
     if total_duration <= sample_duration || num_samples <= 1 {
         return vec![0.0];
     }

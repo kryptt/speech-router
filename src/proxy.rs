@@ -35,10 +35,7 @@ pub async fn forward(req: ProxyRequest<'_>) -> Response {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, url = %url, "upstream request failed");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream unavailable",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "upstream unavailable");
         }
     };
 

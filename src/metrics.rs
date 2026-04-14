@@ -5,9 +5,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
-const DURATION_BUCKETS: &[f64] = &[
-    0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
-];
+const DURATION_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0];
 
 /// Prometheus metrics for the speech router.
 ///
@@ -57,11 +55,7 @@ impl Metrics {
 }
 
 /// Build the label set for `requests_total`.
-pub fn request_labels(
-    protocol: &str,
-    operation: &str,
-    status: &str,
-) -> Vec<(String, String)> {
+pub fn request_labels(protocol: &str, operation: &str, status: &str) -> Vec<(String, String)> {
     vec![
         ("protocol".to_owned(), protocol.to_owned()),
         ("operation".to_owned(), operation.to_owned()),

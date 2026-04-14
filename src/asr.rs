@@ -150,10 +150,7 @@ fn iso639_1_to_3(code: &str) -> Option<&'static str> {
 ///
 /// Audio tracks use ISO 639-2 (3-letter) tags while Whisper uses ISO 639-1
 /// (2-letter). This function converts `lang` to 639-2 before comparison.
-fn find_track_by_language<'a>(
-    tracks: &'a [AudioTrack],
-    lang: &str,
-) -> Option<&'a AudioTrack> {
+fn find_track_by_language<'a>(tracks: &'a [AudioTrack], lang: &str) -> Option<&'a AudioTrack> {
     let target_3 = iso639_1_to_3(lang)?;
     tracks.iter().find(|t| {
         t.language
@@ -297,12 +294,12 @@ async fn select_and_transcribe_video(
             )
         })?
         .map_err(|e| {
-        tracing::warn!(error = %e, "ffprobe audio track probing failed");
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to probe audio tracks",
-        )
-    })?;
+            tracing::warn!(error = %e, "ffprobe audio track probing failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to probe audio tracks",
+            )
+        })?;
 
     tracing::info!(
         track_count = tracks.len(),
@@ -408,16 +405,15 @@ async fn select_and_transcribe_audio(
     speaches_url: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
-    let detected =
-        detect_language_from_file(speaches_url, model, client, audio_path)
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "language detection failed");
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "language detection failed",
-                )
-            })?;
+    let detected = detect_language_from_file(speaches_url, model, client, audio_path)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "language detection failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "language detection failed",
+            )
+        })?;
 
     tracing::info!(
         detected_lang = %detected,
@@ -498,10 +494,15 @@ async fn send_to_speaches(
 
     let url = format!("{}{}", speaches_url, task.endpoint());
 
-    let upstream = client.post(&url).multipart(form).send().await.map_err(|e| {
-        tracing::warn!(error = %e, "speaches request failed");
-        error_response(StatusCode::BAD_GATEWAY, "upstream unavailable")
-    })?;
+    let upstream = client
+        .post(&url)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "speaches request failed");
+            error_response(StatusCode::BAD_GATEWAY, "upstream unavailable")
+        })?;
 
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -765,19 +766,12 @@ struct AudioFile {
 }
 
 async fn extract_audio_file(mut multipart: Multipart) -> Result<AudioFile, Response> {
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "multipart parse error");
-            error_response(StatusCode::BAD_REQUEST, "invalid multipart body")
-        })?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        tracing::warn!(error = %e, "multipart parse error");
+        error_response(StatusCode::BAD_REQUEST, "invalid multipart body")
+    })? {
         if field.name() == Some("audio_file") {
-            let file_name = field
-                .file_name()
-                .unwrap_or("audio.wav")
-                .to_string();
+            let file_name = field.file_name().unwrap_or("audio.wav").to_string();
             // Write the upload to a temp file instead of buffering in memory.
             let named = tempfile::NamedTempFile::new().map_err(|e| {
                 tracing::warn!(error = %e, "failed to create temp file");
@@ -848,7 +842,10 @@ async fn wrap_raw_pcm_as_wav(audio: AudioFile) -> Result<AudioFile, Response> {
         .tempfile()
         .map_err(|e| {
             tracing::warn!(error = %e, "failed to create WAV temp file");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to create temp file")
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to create temp file",
+            )
         })?;
     let wav_path = named.into_temp_path();
 
@@ -1014,10 +1011,7 @@ mod tests {
 
     #[test]
     fn find_track_no_match_returns_none() {
-        let tracks = vec![
-            make_track(1, Some("eng")),
-            make_track(2, Some("deu")),
-        ];
+        let tracks = vec![make_track(1, Some("eng")), make_track(2, Some("deu"))];
         assert!(find_track_by_language(&tracks, "fr").is_none());
     }
 
@@ -1030,6 +1024,9 @@ mod tests {
     #[test]
     fn find_track_case_insensitive() {
         let tracks = vec![make_track(1, Some("ENG"))];
-        assert_eq!(find_track_by_language(&tracks, "en").map(|t| t.index), Some(1));
+        assert_eq!(
+            find_track_by_language(&tracks, "en").map(|t| t.index),
+            Some(1)
+        );
     }
 }

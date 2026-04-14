@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::extract::DefaultBodyLimit;
 use axum::routing::{any, get, post};
-use axum::Router;
 use prometheus_client::registry::Registry;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -119,10 +119,10 @@ async fn main() {
         state.config.public_addr, state.config.internal_addr
     );
 
-    let public_server = axum::serve(public_listener, public_router)
-        .with_graceful_shutdown(shutdown_signal());
-    let internal_server = axum::serve(internal_listener, internal_router)
-        .with_graceful_shutdown(shutdown_signal());
+    let public_server =
+        axum::serve(public_listener, public_router).with_graceful_shutdown(shutdown_signal());
+    let internal_server =
+        axum::serve(internal_listener, internal_router).with_graceful_shutdown(shutdown_signal());
 
     let (r1, r2) = tokio::join!(public_server.into_future(), internal_server.into_future(),);
 
