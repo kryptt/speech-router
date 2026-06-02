@@ -411,10 +411,33 @@ async fn select_and_transcribe(
     }
 }
 
-/// The primary STT upstream — language detection always uses this one; failover
-/// applies only to the transcribe/translate call (plan 2026-06-02-003).
-fn primary_base(stt_bases: &[String]) -> &str {
-    stt_bases.first().map(String::as_str).unwrap_or_default()
+/// Detect the language of an audio file, failing over across `stt_bases` in
+/// order: the first upstream that yields a detection wins.
+///
+/// Detection runs *before* the transcribe/translate call, so if it stayed
+/// pinned to the primary, an rh-anine outage would fail `/asr` (Bazarr) at the
+/// detection step and never reach the failover-capable transcription. Unlike
+/// the transcription failover, this falls through on ANY detection error (not
+/// only transport failures): detection is best-effort and has no partial-
+/// response risk, so a failure on the primary should still try the backup
+/// (plan 2026-06-02-003).
+async fn detect_language_with_failover(
+    stt_bases: &[String],
+    model: &str,
+    client: &reqwest::Client,
+    audio_path: &Path,
+) -> Result<String, String> {
+    let mut last_err = "no STT upstream configured".to_string();
+    for base in stt_bases {
+        match detect_language_from_file(base, model, client, audio_path).await {
+            Ok(lang) => return Ok(lang),
+            Err(e) => {
+                tracing::warn!(error = %e, upstream = %base, "language detection failed on upstream, trying next");
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Handle a video file: probe tracks, try the language-matched track first,
@@ -431,7 +454,6 @@ async fn select_and_transcribe_video(
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
-    let stt_base = primary_base(stt_bases);
     let video_path_owned = video_path.to_path_buf();
     let tracks = tokio::task::spawn_blocking(move || ffmpeg::probe_audio_tracks(&video_path_owned))
         .await
@@ -478,7 +500,7 @@ async fn select_and_transcribe_video(
     for track_index in attempts {
         let audio = extract_video_audio_track(video_path, track_index).await?;
 
-        let detected = detect_language_from_file(stt_base, model, client, &audio.temp_path)
+        let detected = detect_language_with_failover(stt_bases, model, client, &audio.temp_path)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "language detection failed");
@@ -560,8 +582,7 @@ async fn select_and_transcribe_audio(
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
-    let stt_base = primary_base(stt_bases);
-    let detected = detect_language_from_file(stt_base, model, client, audio_path)
+    let detected = detect_language_with_failover(stt_bases, model, client, audio_path)
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "language detection failed");
@@ -798,18 +819,15 @@ pub async fn handle_detect_language(
         audio
     };
 
-    let stt_base = match state.stt_upstreams.first() {
-        Some(b) => b.as_str(),
-        None => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no STT upstream configured",
-            );
-        }
-    };
+    if state.stt_upstreams.is_empty() {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no STT upstream configured",
+        );
+    }
 
-    let code = match detect_language_from_file(
-        stt_base,
+    let code = match detect_language_with_failover(
+        &state.stt_upstreams,
         &state.stt_model,
         &state.client,
         &audio.temp_path,
@@ -1549,6 +1567,33 @@ mod failover_tests {
         );
         assert_eq!(served(&metrics, &busy), 1);
         assert_eq!(fell_through(&metrics, &busy), 0);
+    }
+
+    #[tokio::test]
+    async fn detection_fails_over_to_second_upstream() {
+        use std::io::Write;
+        // 1 s of silence as a valid 16 kHz mono 16-bit WAV so ffmpeg can probe
+        // its duration and take the single-request detection path.
+        crate::ffmpeg::init();
+        let pcm = vec![0u8; 32000];
+        let header = crate::wyoming::wav_header(pcm.len() as u32, 16000, 1, 2);
+        let mut f = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        f.write_all(&header).unwrap();
+        f.write_all(&pcm).unwrap();
+        let path = f.into_temp_path();
+
+        let down = closed_addr().await;
+        let (up, _recv, _hits) = spawn_mock(200, r#"{"language":"english"}"#).await;
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let bases = vec![down, up];
+        let lang = detect_language_with_failover(&bases, "whisper", &client, &path)
+            .await
+            .expect("detection fails over to the healthy upstream");
+        assert_eq!(lang, "en");
     }
 
     #[tokio::test]
