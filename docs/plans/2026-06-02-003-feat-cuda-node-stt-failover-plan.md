@@ -1,7 +1,7 @@
 ---
 title: "feat: CUDA-node STT failover (hr-main) for speech-router"
 type: feat
-status: active
+status: completed
 date: 2026-06-02
 origin: docs/plans/2026-06-02-001-feat-stt-offload-strix-halo-plan.md  # the "Fast-Follow (Deferred)" section
 ---
@@ -191,7 +191,15 @@ before speech-router is allowed to use the CUDA upstream.
 **Verification:** CUDA whisper transcribes on GPU; chat models unbroken; documented RTF + a
 go/no-go before Unit 5.
 
-- [ ] **Unit 5: Enable failover + observe**
+- [x] **Unit 5: Enable failover + observe** — DONE. speech-router 0.5.0 then 0.5.1 deployed with
+  `STT_URLS=rh-anine,cuda`. Two live drills (rh-anine `llama-swap` scaled to 0): **passthrough +
+  Wyoming failed over to CUDA correctly**; steady state returns to rh-anine. Drill 1 **exposed** that
+  `/asr` (Bazarr) did NOT fail over — language detection was primary-pinned and runs before the
+  transcribe call → `language detection failed`. Fixed in **0.5.1** (`detect_language_with_failover`,
+  commit 022fcba); drill 2 confirmed `/asr` now fails over end-to-end (detected `english`, full
+  transcript via CUDA). Metric `…stt_upstream_attempts_total{outcome="fell_through"}` fired on rh-anine
+  during outages. NOTE for drills: Fleet drift-correction reverts a manual `kubectl scale` — pause the
+  GitRepo (`spec.paused=true`) for the outage window, then unpause.
 
 **Goal:** Add the CUDA upstream to speech-router and verify real failover.
 
