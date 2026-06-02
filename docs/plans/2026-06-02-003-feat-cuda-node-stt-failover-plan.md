@@ -147,7 +147,7 @@ matrix; NetworkPolicy admit speech-router).
 **Verification:** `kustomize build` renders; image swapped; matrix admits whisper without a
 GLM/gemma+whisper OOM state.
 
-- [ ] **Unit 3: speech-router ordered STT failover**
+- [x] **Unit 3: speech-router ordered STT failover** — done (0.5.0, commit 4054055). Transport-error-only failover across asr/wyoming/passthrough, per-upstream metric, body re-materialised per attempt. ce:review hardening: /health probes all upstreams (so a primary outage doesn't fail readiness & defeat failover); buffered paths fail over on mid-body transport errors. 65 tests, clippy+fmt clean.
 
 **Goal:** Make speech-router try `STT_URLS` in order, failing over correctly.
 
