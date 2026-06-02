@@ -262,7 +262,7 @@ the decision matrix.
 **Verification:** every matrix row has a passing test; a property test confirms the output is a
 permutation of the input.
 
-- [ ] **Unit 3: Consult ordering in the STT call sites**
+- [x] **Unit 3: Consult ordering in the STT call sites**
 
 **Goal:** Route each STT path through `ordered_upstreams(...)` instead of the raw config order.
 

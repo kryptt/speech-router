@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::metrics::{Metrics, stt_upstream_labels};
+use crate::node_state::{NodeStates, SharedNodeStates, ordered_upstreams};
 use crate::proxy::is_transport_failure;
 
 // ---------------------------------------------------------------------------
@@ -309,6 +310,7 @@ impl SttSession {
 async fn finish_stt(
     session: &SttSession,
     config: &Config,
+    states: &NodeStates,
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Event, String> {
@@ -322,10 +324,13 @@ async fn finish_stt(
     if config.stt_upstreams.is_empty() {
         return Err("no STT upstream configured".to_string());
     }
-    let last_idx = config.stt_upstreams.len() - 1;
+    // Reorder by current node state (R1–R4); a permutation of stt_upstreams, so
+    // the transport-failover loop below still tries every upstream (R5).
+    let (order, _decision) = ordered_upstreams(&config.stt_upstreams, states, &config.stt_model);
+    let last_idx = order.len() - 1;
 
     let mut last_err = String::new();
-    for (idx, stt_base) in config.stt_upstreams.iter().enumerate() {
+    for (idx, stt_base) in order.iter().enumerate() {
         let is_last = idx == last_idx;
 
         // Clone the wav per attempt — the multipart body is single-use.
@@ -503,6 +508,7 @@ async fn handle_tts<W: AsyncWriteExt + Unpin>(
 async fn handle_connection(
     stream: TcpStream,
     config: Arc<Config>,
+    node_states: SharedNodeStates,
     client: Arc<reqwest::Client>,
     metrics: Arc<Metrics>,
 ) {
@@ -585,7 +591,11 @@ async fn handle_connection(
 
             "audio-stop" => {
                 if let Some(ref session) = stt_session {
-                    match finish_stt(session, &config, &client, &metrics).await {
+                    // Read the snapshot per transcription so reordering reflects
+                    // the latest node state (lock-free, off the hot path).
+                    // `load_full` clones the inner Arc so it is safe across awaits.
+                    let snapshot = node_states.load_full();
+                    match finish_stt(session, &config, &snapshot, &client, &metrics).await {
                         Ok(transcript) => {
                             if let Err(e) = write_event(&mut write_half, &transcript).await {
                                 warn!(%addr, error = %e, "failed to send transcript");
@@ -653,6 +663,7 @@ async fn handle_connection(
 pub async fn serve(
     listener: TcpListener,
     config: Arc<Config>,
+    node_states: SharedNodeStates,
     client: Arc<reqwest::Client>,
     metrics: Arc<Metrics>,
 ) {
@@ -666,9 +677,16 @@ pub async fn serve(
         match listener.accept().await {
             Ok((stream, _)) => {
                 let config = Arc::clone(&config);
+                let node_states = Arc::clone(&node_states);
                 let client = Arc::clone(&client);
                 let metrics = Arc::clone(&metrics);
-                tokio::spawn(handle_connection(stream, config, client, metrics));
+                tokio::spawn(handle_connection(
+                    stream,
+                    config,
+                    node_states,
+                    client,
+                    metrics,
+                ));
             }
             Err(e) => {
                 warn!(error = %e, "wyoming accept error");
@@ -1101,7 +1119,7 @@ mod failover_tests {
             .unwrap();
         let config = cfg(vec![down.clone(), up.clone()]);
 
-        let event = finish_stt(&session(), &config, &client, &metrics)
+        let event = finish_stt(&session(), &config, &NodeStates::new(), &client, &metrics)
             .await
             .expect("transcript via failover");
 
@@ -1130,7 +1148,7 @@ mod failover_tests {
         let client = reqwest::Client::new();
         let config = cfg(vec![up.clone()]);
 
-        let event = finish_stt(&session(), &config, &client, &metrics)
+        let event = finish_stt(&session(), &config, &NodeStates::new(), &client, &metrics)
             .await
             .expect("transcript");
         let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
@@ -1153,7 +1171,7 @@ mod failover_tests {
             .unwrap();
         let config = cfg(vec![down1.clone(), down2.clone()]);
 
-        let result = finish_stt(&session(), &config, &client, &metrics).await;
+        let result = finish_stt(&session(), &config, &NodeStates::new(), &client, &metrics).await;
         assert!(result.is_err(), "all upstreams down must return Err");
 
         let ft = |base: &str| {
@@ -1164,5 +1182,69 @@ mod failover_tests {
         };
         assert_eq!(ft(&down1), 1);
         assert_eq!(ft(&down2), 1);
+    }
+
+    // -- state-aware reorder (Unit 3) --
+
+    #[tokio::test]
+    async fn wyoming_reorders_when_primary_marked_down() {
+        // Snapshot says the primary is unreachable and the failover reachable →
+        // finish_stt must hit the failover first and never attempt the (down)
+        // primary, so no fell_through is recorded for it.
+        let primary = closed_addr().await;
+        let (failover, received) = spawn_mock(200, r#"{"text":"warm"}"#).await;
+        let mut reg = Registry::default();
+        let metrics = Metrics::new(&mut reg);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let config = cfg(vec![primary.clone(), failover.clone()]);
+
+        let states: NodeStates = [
+            (
+                primary.clone(),
+                crate::node_state::NodeSnapshot {
+                    reachable: false,
+                    ready_models: Default::default(),
+                },
+            ),
+            (
+                failover.clone(),
+                crate::node_state::NodeSnapshot {
+                    reachable: true,
+                    ready_models: Default::default(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let event = finish_stt(&session(), &config, &states, &client, &metrics)
+            .await
+            .expect("transcript via reordered failover");
+        let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
+        assert_eq!(data["text"], "warm");
+        assert!(
+            received.load(Ordering::SeqCst) >= 3244,
+            "failover received the full wav"
+        );
+
+        let ft = |base: &str| {
+            metrics
+                .stt_upstream_attempts
+                .get_or_create(&stt_upstream_labels(base, "fell_through"))
+                .get()
+        };
+        assert_eq!(
+            ft(&primary),
+            0,
+            "down primary must not be contacted (reorder put failover first)"
+        );
+        let served = metrics
+            .stt_upstream_attempts
+            .get_or_create(&stt_upstream_labels(&failover, "served"))
+            .get();
+        assert_eq!(served, 1);
     }
 }

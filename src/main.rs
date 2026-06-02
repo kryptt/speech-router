@@ -15,6 +15,7 @@ use tracing::info;
 use speech_router::asr::{self, AsrState};
 use speech_router::config::Config;
 use speech_router::metrics::{self, Metrics};
+use speech_router::node_state::{self, SharedNodeStates};
 use speech_router::proxy;
 
 // ---------------------------------------------------------------------------
@@ -27,6 +28,9 @@ struct AppState {
     client: Arc<reqwest::Client>,
     metrics: Arc<Metrics>,
     registry: Arc<Registry>,
+    /// Shared node-state snapshot for state-aware STT routing (empty when the
+    /// poller is disabled → static ordering).
+    node_states: SharedNodeStates,
 }
 
 // ---------------------------------------------------------------------------
@@ -72,11 +76,21 @@ async fn main() {
     let mut registry = Registry::default();
     let metrics = Arc::new(Metrics::new(&mut registry));
 
+    // Spawn the background node-state poller (if enabled) and hold the shared
+    // snapshot handle. Reads are lock-free and off the request hot path; when
+    // STATE_POLL_INTERVAL_SECS=0 the snapshot stays empty and routing is static.
+    let node_states = node_state::spawn(
+        config.stt_upstreams.clone(),
+        client.clone(),
+        config.state_poll_interval_secs,
+    );
+
     let state = AppState {
         config: Arc::new(config),
         client,
         metrics,
         registry: Arc::new(registry),
+        node_states,
     };
 
     // Wyoming protocol TCP server (STT + TTS via Speaches).
@@ -86,6 +100,7 @@ async fn main() {
     tokio::spawn(speech_router::wyoming::serve(
         wyoming_listener,
         state.config.clone(),
+        state.node_states.clone(),
         state.client.clone(),
         state.metrics.clone(),
     ));
@@ -96,6 +111,7 @@ async fn main() {
         stt_translate_model: state.config.stt_translate_model.clone(),
         client: state.client.clone(),
         metrics: state.metrics.clone(),
+        node_states: state.node_states.clone(),
     };
 
     let asr_router: Router<()> = Router::new()
@@ -244,9 +260,17 @@ async fn passthrough_transcriptions(
         "/upstream/{}/v1/audio/transcriptions",
         state.config.stt_model
     );
-    let last_idx = state.config.stt_upstreams.len() - 1;
+    // Reorder by current node state (R1–R4); a permutation of stt_upstreams, so
+    // the transport-failover loop still tries every upstream (R5).
+    let snapshot = state.node_states.load_full();
+    let (order, _decision) = node_state::ordered_upstreams(
+        &state.config.stt_upstreams,
+        &snapshot,
+        &state.config.stt_model,
+    );
+    let last_idx = order.len() - 1;
 
-    for (idx, base) in state.config.stt_upstreams.iter().enumerate() {
+    for (idx, base) in order.iter().enumerate() {
         let is_last = idx == last_idx;
         let result = proxy::try_forward(proxy::ProxyRequest {
             client: &state.client,
@@ -458,7 +482,30 @@ mod passthrough_failover_tests {
             client,
             metrics,
             registry: Arc::new(registry),
+            node_states: node_state::new_shared(),
         }
+    }
+
+    /// Build an AppState whose node-state snapshot marks the given bases with
+    /// the supplied reachability (ready models omitted — irrelevant for these
+    /// reorder tests).
+    fn app_state_with_reachability(bases: Vec<String>, reachable: &[bool]) -> AppState {
+        let state = app_state(bases.clone());
+        let snap: speech_router::node_state::NodeStates = bases
+            .iter()
+            .zip(reachable.iter())
+            .map(|(base, &r)| {
+                (
+                    base.clone(),
+                    speech_router::node_state::NodeSnapshot {
+                        reachable: r,
+                        ready_models: Default::default(),
+                    },
+                )
+            })
+            .collect();
+        state.node_states.store(Arc::new(snap));
+        state
     }
 
     fn fell_through(state: &AppState, base: &str) -> u64 {
@@ -534,6 +581,37 @@ mod passthrough_failover_tests {
             backup_recv.load(Ordering::SeqCst),
             0,
             "a 503 must not trigger failover"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_reorders_when_primary_marked_down() {
+        // Snapshot marks the primary unreachable and the failover reachable →
+        // the passthrough must hit the failover first and never attempt the
+        // (closed) primary, so no fell_through is recorded for it.
+        let primary = closed_addr().await;
+        let (failover, received) = spawn_mock(200).await;
+        let state =
+            app_state_with_reachability(vec![primary.clone(), failover.clone()], &[false, true]);
+
+        let resp = passthrough_transcriptions(
+            &state,
+            Method::POST,
+            None,
+            &HeaderMap::new(),
+            Bytes::from_static(&[3u8; 900]),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            received.load(Ordering::SeqCst) >= 900,
+            "reordered failover received the full body"
+        );
+        assert_eq!(
+            fell_through(&state, &primary),
+            0,
+            "down primary must not be contacted"
         );
     }
 }

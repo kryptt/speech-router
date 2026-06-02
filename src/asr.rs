@@ -14,6 +14,7 @@ use futures_util::TryStreamExt;
 
 use crate::ffmpeg::{self, AudioTrack};
 use crate::metrics::{Metrics, stt_upstream_labels};
+use crate::node_state::{NodeStates, SharedNodeStates, ordered_upstreams};
 use crate::proxy::{error_response, is_transport_failure};
 use crate::wyoming::wav_header;
 
@@ -292,6 +293,10 @@ pub struct AsrState {
     pub stt_translate_model: String,
     pub client: std::sync::Arc<reqwest::Client>,
     pub metrics: std::sync::Arc<Metrics>,
+    /// Shared node-state snapshot driving state-aware upstream ordering. An
+    /// empty snapshot (poller disabled) degrades to the static `stt_upstreams`
+    /// order.
+    pub node_states: SharedNodeStates,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +346,11 @@ pub async fn handle_asr(
         );
     }
 
+    // Read the node-state snapshot once for this request; both detection and
+    // transcription reorder against it (lock-free, off the hot path).
+    // `load_full` clones the inner Arc so it can be held across awaits safely.
+    let snapshot = state.node_states.load_full();
+
     match select_and_transcribe(
         &audio.temp_path,
         &audio.file_name,
@@ -350,6 +360,7 @@ pub async fn handle_asr(
         &state.stt_model,
         &state.stt_translate_model,
         &state.stt_upstreams,
+        &snapshot,
         &state.client,
         &state.metrics,
     )
@@ -379,6 +390,7 @@ async fn select_and_transcribe(
     model: &str,
     translate_model: &str,
     stt_bases: &[String],
+    states: &NodeStates,
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
@@ -391,6 +403,7 @@ async fn select_and_transcribe(
             model,
             translate_model,
             stt_bases,
+            states,
             client,
             metrics,
         )
@@ -404,6 +417,7 @@ async fn select_and_transcribe(
             model,
             translate_model,
             stt_bases,
+            states,
             client,
             metrics,
         )
@@ -424,11 +438,17 @@ async fn select_and_transcribe(
 async fn detect_language_with_failover(
     stt_bases: &[String],
     model: &str,
+    states: &NodeStates,
     client: &reqwest::Client,
     audio_path: &Path,
 ) -> Result<String, String> {
+    // Reorder the upstream list by current node state (R1–R4); detection uses
+    // the STT model. The result is a permutation of `stt_bases`, so every
+    // upstream is still tried — state only chooses the starting order (R5).
+    let (order, _decision) = ordered_upstreams(stt_bases, states, model);
+
     let mut last_err = "no STT upstream configured".to_string();
-    for base in stt_bases {
+    for base in &order {
         match detect_language_from_file(base, model, client, audio_path).await {
             Ok(lang) => return Ok(lang),
             Err(e) => {
@@ -451,6 +471,7 @@ async fn select_and_transcribe_video(
     model: &str,
     translate_model: &str,
     stt_bases: &[String],
+    states: &NodeStates,
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
@@ -500,15 +521,16 @@ async fn select_and_transcribe_video(
     for track_index in attempts {
         let audio = extract_video_audio_track(video_path, track_index).await?;
 
-        let detected = detect_language_with_failover(stt_bases, model, client, &audio.temp_path)
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "language detection failed");
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "language detection failed",
-                )
-            })?;
+        let detected =
+            detect_language_with_failover(stt_bases, model, states, client, &audio.temp_path)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "language detection failed");
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "language detection failed",
+                    )
+                })?;
 
         tracing::info!(
             ?track_index,
@@ -527,6 +549,7 @@ async fn select_and_transcribe_video(
                     response_format,
                     model,
                     stt_bases,
+                    states,
                     client,
                     metrics,
                 )
@@ -544,6 +567,7 @@ async fn select_and_transcribe_video(
                     response_format,
                     translate_model,
                     stt_bases,
+                    states,
                     client,
                     metrics,
                 )
@@ -579,10 +603,11 @@ async fn select_and_transcribe_audio(
     model: &str,
     translate_model: &str,
     stt_bases: &[String],
+    states: &NodeStates,
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
-    let detected = detect_language_with_failover(stt_bases, model, client, audio_path)
+    let detected = detect_language_with_failover(stt_bases, model, states, client, audio_path)
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "language detection failed");
@@ -608,6 +633,7 @@ async fn select_and_transcribe_audio(
                 response_format,
                 model,
                 stt_bases,
+                states,
                 client,
                 metrics,
             )
@@ -622,6 +648,7 @@ async fn select_and_transcribe_audio(
                 response_format,
                 translate_model,
                 stt_bases,
+                states,
                 client,
                 metrics,
             )
@@ -695,12 +722,17 @@ async fn send_with_failover(
     response_format: &str,
     model: &str,
     stt_bases: &[String],
+    states: &NodeStates,
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
-    let last_idx = stt_bases.len().saturating_sub(1);
+    // Reorder by current node state for the model actually requested (transcribe
+    // vs translate may differ). A permutation of `stt_bases` — the loop still
+    // iterates every upstream, so the transport-failover floor is unchanged (R5).
+    let (order, _decision) = ordered_upstreams(stt_bases, states, model);
+    let last_idx = order.len().saturating_sub(1);
 
-    for (idx, stt_base) in stt_bases.iter().enumerate() {
+    for (idx, stt_base) in order.iter().enumerate() {
         let is_last = idx == last_idx;
         let form =
             build_transcription_form(audio_path, language, task, response_format, model).await?;
@@ -826,9 +858,11 @@ pub async fn handle_detect_language(
         );
     }
 
+    let snapshot = state.node_states.load_full();
     let code = match detect_language_with_failover(
         &state.stt_upstreams,
         &state.stt_model,
+        &snapshot,
         &state.client,
         &audio.temp_path,
     )
@@ -1479,6 +1513,17 @@ mod failover_tests {
         client: &reqwest::Client,
         metrics: &Metrics,
     ) -> Result<Response, Response> {
+        // Empty snapshot → static ordering (today's behaviour); these tests
+        // exercise the unchanged transport-failover floor.
+        run_with_states(bases, &NodeStates::new(), client, metrics).await
+    }
+
+    async fn run_with_states(
+        bases: &[String],
+        states: &NodeStates,
+        client: &reqwest::Client,
+        metrics: &Metrics,
+    ) -> Result<Response, Response> {
         let audio = audio_temp();
         send_with_failover(
             &audio,
@@ -1488,10 +1533,27 @@ mod failover_tests {
             "verbose_json",
             "whisper",
             bases,
+            states,
             client,
             metrics,
         )
         .await
+    }
+
+    /// Build a NodeStates with the given (base, reachable, ready-models) tuples.
+    fn states_of(entries: &[(&str, bool, &[&str])]) -> NodeStates {
+        entries
+            .iter()
+            .map(|(base, reachable, ready)| {
+                (
+                    (*base).to_string(),
+                    crate::node_state::NodeSnapshot {
+                        reachable: *reachable,
+                        ready_models: ready.iter().map(|s| s.to_string()).collect(),
+                    },
+                )
+            })
+            .collect()
     }
 
     // axum's Response<Body> is not Debug, so Result::expect can't be used.
@@ -1590,7 +1652,8 @@ mod failover_tests {
             .unwrap();
 
         let bases = vec![down, up];
-        let lang = detect_language_with_failover(&bases, "whisper", &client, &path)
+        let states = NodeStates::new();
+        let lang = detect_language_with_failover(&bases, "whisper", &states, &client, &path)
             .await
             .expect("detection fails over to the healthy upstream");
         assert_eq!(lang, "en");
@@ -1610,5 +1673,67 @@ mod failover_tests {
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(fell_through(&metrics, &down1), 1);
+    }
+
+    // -- state-aware reorder (Unit 3) --
+
+    #[tokio::test]
+    async fn r2_reorders_to_warm_failover_first() {
+        // Primary reachable but model not ready; failover has it warm → the
+        // request must hit the warm failover first and skip the primary.
+        let (primary, _pr, primary_hits) = spawn_mock(200, r#"{"text":"p"}"#).await;
+        let (failover, recv, failover_hits) = spawn_mock(200, r#"{"text":"f"}"#).await;
+        let metrics = test_metrics();
+        let client = reqwest::Client::new();
+
+        let states = states_of(&[
+            (primary.as_str(), true, &[]),
+            (failover.as_str(), true, &["whisper-large-v3-turbo"]),
+        ]);
+        let bases = vec![primary.clone(), failover.clone()];
+
+        let status = ok_status(run_with_states(&bases, &states, &client, &metrics).await);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            failover_hits.load(Ordering::SeqCst),
+            1,
+            "warm failover must be hit first"
+        );
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            0,
+            "cold primary must not be contacted"
+        );
+        assert!(
+            recv.load(Ordering::SeqCst) >= 2048,
+            "full body re-materialised for the reordered upstream"
+        );
+        assert_eq!(served(&metrics, &failover), 1);
+    }
+
+    #[tokio::test]
+    async fn r1_primary_ready_keeps_primary_first() {
+        // Primary ready → unchanged order: the primary is hit first.
+        let (primary, recv, primary_hits) = spawn_mock(200, r#"{"text":"p"}"#).await;
+        let (failover, _fr, failover_hits) = spawn_mock(200, r#"{"text":"f"}"#).await;
+        let metrics = test_metrics();
+        let client = reqwest::Client::new();
+
+        let states = states_of(&[
+            (primary.as_str(), true, &["whisper-large-v3-turbo"]),
+            (failover.as_str(), true, &["whisper-large-v3-turbo"]),
+        ]);
+        let bases = vec![primary.clone(), failover.clone()];
+
+        let status = ok_status(run_with_states(&bases, &states, &client, &metrics).await);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            primary_hits.load(Ordering::SeqCst),
+            1,
+            "ready primary must be hit first"
+        );
+        assert_eq!(failover_hits.load(Ordering::SeqCst), 0);
+        assert!(recv.load(Ordering::SeqCst) >= 2048);
+        assert_eq!(served(&metrics, &primary), 1);
     }
 }
