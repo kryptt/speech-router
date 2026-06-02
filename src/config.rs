@@ -28,6 +28,11 @@ pub struct Config {
     pub internal_addr: SocketAddr,
     pub default_tts_model: String,
     pub default_tts_voice: String,
+    /// Interval, in seconds, between background `/running` polls that drive
+    /// state-aware STT routing. `0` disables the poller entirely, so routing
+    /// falls back to the static `STT_URLS` order (the instant rollback knob).
+    /// Defaults to 5.
+    pub state_poll_interval_secs: u64,
 }
 
 impl Config {
@@ -79,6 +84,10 @@ impl Config {
         let default_tts_voice =
             env::var("DEFAULT_TTS_VOICE").unwrap_or_else(|_| "af_heart".to_string());
 
+        // State-aware-routing poll interval. `0` disables the poller (static
+        // ordering); any other value is the seconds between `/running` polls.
+        let state_poll_interval_secs = parse_env_u64("STATE_POLL_INTERVAL_SECS", 5)?;
+
         Ok(Config {
             stt_upstreams,
             tts_url,
@@ -90,6 +99,7 @@ impl Config {
             internal_addr: SocketAddr::from(([0, 0, 0, 0], internal_port)),
             default_tts_model,
             default_tts_voice,
+            state_poll_interval_secs,
         })
     }
 }
@@ -132,6 +142,15 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 fn parse_env_u16(key: &'static str, default: u16) -> Result<u16, ConfigError> {
+    match env::var(key) {
+        Ok(val) => val
+            .parse()
+            .map_err(|_| ConfigError::InvalidValue { key, value: val }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, ConfigError> {
     match env::var(key) {
         Ok(val) => val
             .parse()
@@ -183,6 +202,7 @@ mod tests {
         "DEFAULT_MODEL",
         "DEFAULT_TTS_MODEL",
         "DEFAULT_TTS_VOICE",
+        "STATE_POLL_INTERVAL_SECS",
     ];
 
     fn clear_all() {

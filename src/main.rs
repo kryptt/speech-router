@@ -443,6 +443,7 @@ mod passthrough_failover_tests {
             internal_addr: "0.0.0.0:9090".parse().unwrap(),
             default_tts_model: "kokoro".to_string(),
             default_tts_voice: "af_heart".to_string(),
+            state_poll_interval_secs: 0,
         };
         let mut registry = Registry::default();
         let metrics = Arc::new(Metrics::new(&mut registry));

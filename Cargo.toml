@@ -4,6 +4,7 @@ version = "0.5.1"
 edition = "2024"
 
 [dependencies]
+arc-swap = "1"
 axum = { version = "0.8", features = ["multipart"] }
 bytes = "1"
 ffmpeg-next = "7"
