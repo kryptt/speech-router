@@ -169,6 +169,164 @@ pub fn spawn(
     shared
 }
 
+// ---------------------------------------------------------------------------
+// Pure ordering decision (Unit 2)
+// ---------------------------------------------------------------------------
+
+/// The decision label emitted alongside a reordered upstream list, mirroring
+/// the rows of the routing decision matrix. Used for the
+/// `stt_routing_decisions_total{decision}` metric (Unit 4) so the policy is
+/// observable in production.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingDecision {
+    /// Primary has the model `ready` (or we have no state for it) — order
+    /// unchanged. This is the steady-state, low-load-on-primary path (R1).
+    PrimaryReady,
+    /// Primary is reachable but the model is not `ready`, and a failover already
+    /// has it `ready` — the warm failover is hoisted first (R2: latency win, no
+    /// extra VRAM cost).
+    FailoverWarm,
+    /// Primary is reachable, model not `ready`, and no failover is warm — keep
+    /// primary-first and let it (cold-)load (R4: don't cold-load the contended
+    /// failover on a mere primary `loading`).
+    PrimaryCold,
+    /// Primary was unreachable at the last poll — reachable failovers are
+    /// hoisted ahead of it to skip the per-request connect wait (R3).
+    PrimaryDown,
+    /// No node was reachable at the last poll — order unchanged; the failover
+    /// loop surfaces the error (R5 floor).
+    AllUnreachable,
+}
+
+impl RoutingDecision {
+    /// Stable metric label for this decision.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoutingDecision::PrimaryReady => "primary_ready",
+            RoutingDecision::FailoverWarm => "failover_warm",
+            RoutingDecision::PrimaryCold => "primary_cold",
+            RoutingDecision::PrimaryDown => "primary_down",
+            RoutingDecision::AllUnreachable => "all_unreachable",
+        }
+    }
+}
+
+/// Best-effort match between a requested model id/alias and a canonical id
+/// reported by `/running`.
+///
+/// llama-swap reports the *canonical* id (e.g. `whisper-large-v3-turbo`) while
+/// speech-router requests an *alias* (e.g. `whisper`). A match is positive only
+/// when we are confident: an exact match, or when the canonical id is the alias
+/// extended by dash-delimited version segments. The comparison is segment-wise
+/// (not raw substring) so `whisper` matches `whisper-large-v3-turbo` but
+/// `whisper-translate` does NOT match `whisper-large-v3-turbo`, and `whisper`
+/// does NOT match an unrelated `whisperx`. Any ambiguity therefore resolves to
+/// "no match", which degrades routing to the safe primary-first order (the
+/// optimisation is lost, never correctness — the failover floor still applies).
+fn model_matches(canonical: &str, requested: &str) -> bool {
+    if canonical == requested {
+        return true;
+    }
+    let mut canon_segments = canonical.split('-');
+    requested
+        .split('-')
+        .all(|seg| canon_segments.next() == Some(seg))
+}
+
+/// Whether a node has the requested model `ready` (best-effort, see
+/// [`model_matches`]).
+fn model_ready(snap: &NodeSnapshot, model: &str) -> bool {
+    snap.ready_models
+        .iter()
+        .any(|canonical| model_matches(canonical, model))
+}
+
+/// Move `bases[idx]` to the front, preserving the relative order of the rest.
+fn hoist(bases: &[String], idx: usize) -> Vec<String> {
+    let mut order = Vec::with_capacity(bases.len());
+    order.push(bases[idx].clone());
+    for (i, base) in bases.iter().enumerate() {
+        if i != idx {
+            order.push(base.clone());
+        }
+    }
+    order
+}
+
+/// Choose the starting order of STT upstreams for a request needing `model`,
+/// given the latest node-state snapshot. Implements the decision matrix from
+/// the plan.
+///
+/// The result is **always a permutation of `bases`** — no entry is ever dropped
+/// (R5) — so the existing ordered transport-failover loop still iterates every
+/// upstream; state only chooses where to *start*. The returned
+/// [`RoutingDecision`] labels which matrix row fired (for the Unit-4 metric).
+///
+/// Safety properties:
+/// - Fewer than two upstreams, or no state for the primary → static order.
+/// - Never hoists a failover on a *mere* primary `loading` (R4): a failover is
+///   only promoted when it is itself `ready` (R2) or the primary is unreachable
+///   (R3). This keeps steady-state load off the contended CUDA failover (R1).
+pub fn ordered_upstreams(
+    bases: &[String],
+    states: &NodeStates,
+    model: &str,
+) -> (Vec<String>, RoutingDecision) {
+    // Nothing to reorder.
+    if bases.len() < 2 {
+        return (bases.to_vec(), RoutingDecision::PrimaryReady);
+    }
+
+    let primary = &bases[0];
+    // No state for the primary (poller disabled, or hasn't polled yet) → treat
+    // as steady state and keep the static order.
+    let Some(primary_snap) = states.get(primary) else {
+        return (bases.to_vec(), RoutingDecision::PrimaryReady);
+    };
+
+    // R1: primary has the model ready → steady state, no reorder.
+    if model_ready(primary_snap, model) {
+        return (bases.to_vec(), RoutingDecision::PrimaryReady);
+    }
+
+    if primary_snap.reachable {
+        // Primary reachable but model not ready. R2: hoist the first failover
+        // that already has the model warm; else R4: keep primary-first and let
+        // it cold-load (never cold-load the contended failover on a mere
+        // primary `loading`).
+        let warm = bases.iter().enumerate().skip(1).find_map(|(i, base)| {
+            states
+                .get(base)
+                .filter(|s| s.reachable && model_ready(s, model))
+                .map(|_| i)
+        });
+        return match warm {
+            Some(idx) => (hoist(bases, idx), RoutingDecision::FailoverWarm),
+            None => (bases.to_vec(), RoutingDecision::PrimaryCold),
+        };
+    }
+
+    // Primary unreachable. R3: route to reachable failovers first (preserving
+    // their relative order), then the remaining bases (the down primary and any
+    // unreachable failovers) in their original order. If none are reachable,
+    // keep the static order and let the loop surface the error.
+    let reachable_failovers: Vec<&String> = bases
+        .iter()
+        .skip(1)
+        .filter(|base| states.get(*base).is_some_and(|s| s.reachable))
+        .collect();
+    if reachable_failovers.is_empty() {
+        return (bases.to_vec(), RoutingDecision::AllUnreachable);
+    }
+    let mut order: Vec<String> = reachable_failovers.iter().map(|b| (*b).clone()).collect();
+    for base in bases {
+        if !reachable_failovers.contains(&base) {
+            order.push(base.clone());
+        }
+    }
+    (order, RoutingDecision::PrimaryDown)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +460,235 @@ mod tests {
         // The node answered, so it is reachable; we just learn no warmth from it.
         assert!(snap.reachable);
         assert!(snap.ready_models.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // model_matches  (alias↔canonical, safe under ambiguity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn model_matches_exact_and_alias_prefix() {
+        // exact
+        assert!(model_matches("whisper", "whisper"));
+        // alias is a dash-delimited prefix of the canonical id
+        assert!(model_matches("whisper-large-v3-turbo", "whisper"));
+        assert!(model_matches("whisper-large-v3", "whisper"));
+    }
+
+    #[test]
+    fn model_matches_is_segment_wise_not_substring() {
+        // `whisper-translate` must NOT match the turbo canonical id.
+        assert!(!model_matches(
+            "whisper-large-v3-turbo",
+            "whisper-translate"
+        ));
+        // `whisper` must NOT match an unrelated `whisperx` (segment, not prefix).
+        assert!(!model_matches("whisperx", "whisper"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ordered_upstreams  (the decision matrix — the core correctness surface)
+    // -----------------------------------------------------------------------
+
+    fn bases() -> Vec<String> {
+        vec!["http://primary".to_string(), "http://failover".to_string()]
+    }
+
+    /// Build a NodeStates entry helper.
+    fn snap(reachable: bool, ready: &[&str]) -> NodeSnapshot {
+        NodeSnapshot {
+            reachable,
+            ready_models: ready.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn states(entries: &[(&str, NodeSnapshot)]) -> NodeStates {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn r1_primary_ready_keeps_order() {
+        let b = bases();
+        let s = states(&[
+            ("http://primary", snap(true, &["whisper-large-v3-turbo"])),
+            ("http://failover", snap(true, &["whisper-large-v3-turbo"])),
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(order, b);
+        assert_eq!(decision, RoutingDecision::PrimaryReady);
+    }
+
+    #[test]
+    fn r2_primary_not_ready_failover_warm_hoists_failover() {
+        let b = bases();
+        let s = states(&[
+            ("http://primary", snap(true, &[])), // reachable, loading/cold
+            ("http://failover", snap(true, &["whisper-large-v3-turbo"])),
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(
+            order,
+            vec!["http://failover".to_string(), "http://primary".to_string()]
+        );
+        assert_eq!(decision, RoutingDecision::FailoverWarm);
+    }
+
+    #[test]
+    fn r4_primary_not_ready_no_warm_failover_keeps_primary_first() {
+        let b = bases();
+        let s = states(&[
+            ("http://primary", snap(true, &[])),
+            ("http://failover", snap(true, &[])), // reachable but also cold
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(order, b, "must NOT cold-load the contended failover");
+        assert_eq!(decision, RoutingDecision::PrimaryCold);
+    }
+
+    #[test]
+    fn r3_primary_unreachable_hoists_reachable_failover() {
+        let b = bases();
+        let s = states(&[
+            ("http://primary", snap(false, &[])),
+            ("http://failover", snap(true, &[])), // reachable, even if cold
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(
+            order,
+            vec!["http://failover".to_string(), "http://primary".to_string()]
+        );
+        assert_eq!(decision, RoutingDecision::PrimaryDown);
+    }
+
+    #[test]
+    fn all_unreachable_keeps_order() {
+        let b = bases();
+        let s = states(&[
+            ("http://primary", snap(false, &[])),
+            ("http://failover", snap(false, &[])),
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(order, b);
+        assert_eq!(decision, RoutingDecision::AllUnreachable);
+    }
+
+    #[test]
+    fn empty_snapshot_keeps_static_order() {
+        let b = bases();
+        let empty = NodeStates::new();
+        for model in ["whisper", "whisper-translate", "anything"] {
+            let (order, decision) = ordered_upstreams(&b, &empty, model);
+            assert_eq!(order, b, "disabled poller must not reorder");
+            assert_eq!(decision, RoutingDecision::PrimaryReady);
+        }
+    }
+
+    #[test]
+    fn single_upstream_never_reorders() {
+        let b = vec!["http://only".to_string()];
+        let s = states(&[("http://only", snap(false, &[]))]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(order, b);
+        assert_eq!(decision, RoutingDecision::PrimaryReady);
+    }
+
+    #[test]
+    fn translate_model_unaffected_by_transcribe_warmth() {
+        // Failover has the turbo (transcribe) model ready but we request the
+        // translate model: model_matches must not falsely treat that as warm,
+        // so we keep primary-first (cold-load on primary).
+        let b = bases();
+        let s = states(&[
+            ("http://primary", snap(true, &[])),
+            ("http://failover", snap(true, &["whisper-large-v3-turbo"])),
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper-translate");
+        assert_eq!(order, b);
+        assert_eq!(decision, RoutingDecision::PrimaryCold);
+    }
+
+    #[test]
+    fn three_upstreams_warm_node_hoisted_others_keep_relative_order() {
+        let b = vec![
+            "http://primary".to_string(),
+            "http://fail-a".to_string(),
+            "http://fail-b".to_string(),
+        ];
+        // Primary reachable-but-cold; fail-b is the warm one.
+        let s = states(&[
+            ("http://primary", snap(true, &[])),
+            ("http://fail-a", snap(true, &[])),
+            ("http://fail-b", snap(true, &["whisper-large-v3-turbo"])),
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        assert_eq!(
+            order,
+            vec![
+                "http://fail-b".to_string(),
+                "http://primary".to_string(),
+                "http://fail-a".to_string(),
+            ]
+        );
+        assert_eq!(decision, RoutingDecision::FailoverWarm);
+    }
+
+    #[test]
+    fn three_upstreams_primary_down_reachable_failovers_first() {
+        let b = vec![
+            "http://primary".to_string(),
+            "http://fail-a".to_string(),
+            "http://fail-b".to_string(),
+        ];
+        // Primary down, fail-a unreachable too, fail-b reachable.
+        let s = states(&[
+            ("http://primary", snap(false, &[])),
+            ("http://fail-a", snap(false, &[])),
+            ("http://fail-b", snap(true, &[])),
+        ]);
+        let (order, decision) = ordered_upstreams(&b, &s, "whisper");
+        // Reachable failover first; the rest keep original order.
+        assert_eq!(
+            order,
+            vec![
+                "http://fail-b".to_string(),
+                "http://primary".to_string(),
+                "http://fail-a".to_string(),
+            ]
+        );
+        assert_eq!(decision, RoutingDecision::PrimaryDown);
+    }
+
+    /// R5 property: the output is always a permutation of the input, for every
+    /// reachability/warmth combination across two upstreams and both models.
+    #[test]
+    fn output_is_always_a_permutation() {
+        let b = bases();
+        let bools = [false, true];
+        for &p_reach in &bools {
+            for p_ready in [vec![], vec!["whisper-large-v3-turbo"]] {
+                for &f_reach in &bools {
+                    for f_ready in [vec![], vec!["whisper-large-v3-turbo"]] {
+                        let s = states(&[
+                            ("http://primary", snap(p_reach, &p_ready)),
+                            ("http://failover", snap(f_reach, &f_ready)),
+                        ]);
+                        for model in ["whisper", "whisper-translate"] {
+                            let (order, _decision) = ordered_upstreams(&b, &s, model);
+                            let mut sorted = order.clone();
+                            sorted.sort();
+                            let mut expected = b.clone();
+                            expected.sort();
+                            assert_eq!(
+                                sorted, expected,
+                                "order must be a permutation of bases (p_reach={p_reach}, f_reach={f_reach}, model={model})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

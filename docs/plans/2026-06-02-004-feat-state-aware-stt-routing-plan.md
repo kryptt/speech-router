@@ -228,7 +228,7 @@ reuse (`state.client`); tolerant `serde_json::Value` parsing as in `asr.rs`.
 **Verification:** snapshot parser unit tests pass; against the live cluster the snapshot reflects
 both nodes' loaded models within one interval.
 
-- [ ] **Unit 2: Pure ordering decision**
+- [x] **Unit 2: Pure ordering decision**
 
 **Goal:** `ordered_upstreams(stt_bases, &NodeStates, requested_model) -> Vec<String>` implementing
 the decision matrix.
