@@ -20,6 +20,12 @@ pub struct Metrics {
     /// is returned as a fallback. A non-zero rate signals a (silent-to-the-user)
     /// STT backend outage and is the trigger for investigating/rolling back.
     pub stt_empty_transcript_fallback: Counter,
+    /// Per-upstream STT attempt outcomes, labeled by `upstream` (the base URL)
+    /// and `outcome` (`served` | `fell_through`). A non-zero `fell_through` on
+    /// the primary upstream is the signal that the primary node is unreachable
+    /// and traffic is failing over (plan 2026-06-02-003, R3) — it must not be
+    /// allowed to silently mask a broken node.
+    pub stt_upstream_attempts: Family<Vec<(String, String)>, Counter>,
 }
 
 impl Metrics {
@@ -57,13 +63,29 @@ impl Metrics {
             stt_empty_transcript_fallback.clone(),
         );
 
+        let stt_upstream_attempts = Family::default();
+        registry.register(
+            "speech_router_stt_upstream_attempts_total",
+            "STT upstream attempts by upstream URL and outcome (served | fell_through)",
+            stt_upstream_attempts.clone(),
+        );
+
         Metrics {
             requests_total,
             request_duration,
             wyoming_connections,
             stt_empty_transcript_fallback,
+            stt_upstream_attempts,
         }
     }
+}
+
+/// Build the label set for `stt_upstream_attempts`.
+pub fn stt_upstream_labels(upstream: &str, outcome: &str) -> Vec<(String, String)> {
+    vec![
+        ("upstream".to_owned(), upstream.to_owned()),
+        ("outcome".to_owned(), outcome.to_owned()),
+    ]
 }
 
 /// Build the label set for `requests_total`.

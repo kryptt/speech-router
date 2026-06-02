@@ -15,7 +15,25 @@ pub struct ProxyRequest<'a> {
 }
 
 /// Forward a request to the backend and stream the response back.
+///
+/// Any send failure is mapped to a 502 — callers that need to distinguish a
+/// transport failure (to fail over) should use [`try_forward`] instead.
 pub async fn forward(req: ProxyRequest<'_>) -> Response {
+    let url = format!("{}{}", req.backend_url, req.path);
+    match try_forward(req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(error = %e, url = %url, "upstream request failed");
+            error_response(StatusCode::BAD_GATEWAY, "upstream unavailable")
+        }
+    }
+}
+
+/// Forward a request, returning `Err(reqwest::Error)` if the *send* itself
+/// failed so the caller can inspect it (e.g. [`is_transport_failure`]) and
+/// decide whether to retry on another upstream. A successful send — even one
+/// that yields a 5xx status — returns `Ok` with the streamed response.
+pub async fn try_forward(req: ProxyRequest<'_>) -> Result<Response, reqwest::Error> {
     let mut url = format!("{}{}", req.backend_url, req.path);
     if let Some(q) = req.query {
         url.push('?');
@@ -31,13 +49,7 @@ pub async fn forward(req: ProxyRequest<'_>) -> Response {
         }
     }
 
-    let upstream_resp = match builder.body(req.body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, url = %url, "upstream request failed");
-            return error_response(StatusCode::BAD_GATEWAY, "upstream unavailable");
-        }
-    };
+    let upstream_resp = builder.body(req.body).send().await?;
 
     let status = StatusCode::from_u16(upstream_resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -60,11 +72,23 @@ pub async fn forward(req: ProxyRequest<'_>) -> Response {
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
 
-    response
+    Ok(response)
 }
 
 /// Build a JSON error response.
 pub fn error_response(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "error": message });
     (status, axum::Json(body)).into_response()
+}
+
+/// Whether a failed `reqwest` send means "this upstream is down — try the next".
+///
+/// Only transport-level failures qualify: a refused/timed-out *connection* means
+/// the node is unreachable. If the upstream returned ANY HTTP response (even a
+/// 5xx, including a llama-swap cold-load 503), it is alive — we surface that
+/// response rather than masking it behind failover. This is the failover trigger
+/// predicate (plan 2026-06-02-003, R3): don't hide a broken-but-responding node,
+/// and don't mistake a model cold-load for an outage.
+pub fn is_transport_failure(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
 }

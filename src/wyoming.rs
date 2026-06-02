@@ -7,7 +7,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, stt_upstream_labels};
+use crate::proxy::is_transport_failure;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -298,11 +299,18 @@ impl SttSession {
     }
 }
 
-/// Handle `audio-stop`: build WAV, POST to Speaches, return transcript event.
+/// Handle `audio-stop`: build WAV, POST to the STT backend (failing over
+/// through the ordered upstream list), return a transcript event.
+///
+/// The wav bytes are built once and cloned per attempt — a `reqwest` multipart
+/// body is single-use, so a failover retry needs its own copy. Failover
+/// triggers only on a transport-level failure (see [`is_transport_failure`]);
+/// any HTTP response is treated as the node being alive (plan 2026-06-02-003).
 async fn finish_stt(
     session: &SttSession,
     config: &Config,
     client: &reqwest::Client,
+    metrics: &Metrics,
 ) -> Result<Event, String> {
     let pcm_len = session.pcm.len() as u32;
     let header = wav_header(pcm_len, session.rate, session.channels, session.width);
@@ -311,53 +319,105 @@ async fn finish_stt(
     wav.extend_from_slice(&header);
     wav.extend_from_slice(&session.pcm);
 
-    let part = reqwest::multipart::Part::bytes(wav)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")
-        .map_err(|e| format!("mime error: {e}"))?;
+    if config.stt_upstreams.is_empty() {
+        return Err("no STT upstream configured".to_string());
+    }
+    let last_idx = config.stt_upstreams.len() - 1;
 
-    let stt_base = config
-        .stt_upstreams
-        .first()
-        .ok_or_else(|| "no STT upstream configured".to_string())?;
+    let mut last_err = String::new();
+    for (idx, stt_base) in config.stt_upstreams.iter().enumerate() {
+        let is_last = idx == last_idx;
 
-    let form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("model", config.stt_model.clone())
-        .text("language", session.language.clone())
-        .text("response_format", "json");
+        // Clone the wav per attempt — the multipart body is single-use.
+        let part = reqwest::multipart::Part::bytes(wav.clone())
+            .file_name("audio.wav")
+            .mime_str("audio/wav")
+            .map_err(|e| format!("mime error: {e}"))?;
 
-    let url = format!(
-        "{stt_base}/upstream/{}/v1/audio/transcriptions",
-        config.stt_model
-    );
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", config.stt_model.clone())
+            .text("language", session.language.clone())
+            .text("response_format", "json");
 
-    let resp = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| format!("stt backend request failed: {e}"))?;
+        let url = format!(
+            "{stt_base}/upstream/{}/v1/audio/transcriptions",
+            config.stt_model
+        );
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("stt backend returned {status}: {body}"));
+        let record_fell_through = |stt_base: &str| {
+            metrics
+                .stt_upstream_attempts
+                .get_or_create(&stt_upstream_labels(stt_base, "fell_through"))
+                .inc();
+        };
+        let record_served = |stt_base: &str| {
+            metrics
+                .stt_upstream_attempts
+                .get_or_create(&stt_upstream_labels(stt_base, "served"))
+                .inc();
+        };
+
+        let resp = match client.post(&url).multipart(form).send().await {
+            Ok(resp) => resp,
+            Err(e) if is_transport_failure(&e) && !is_last => {
+                warn!(error = %e, upstream = %stt_base, "wyoming stt upstream unreachable, failing over");
+                record_fell_through(stt_base);
+                last_err = format!("stt backend request failed: {e}");
+                continue;
+            }
+            Err(e) => {
+                if is_transport_failure(&e) {
+                    record_fell_through(stt_base);
+                }
+                return Err(format!("stt backend request failed: {e}"));
+            }
+        };
+
+        if !resp.status().is_success() {
+            // The upstream responded (even with an error status) — it is alive,
+            // so this counts as served; surface the error (caller falls back to
+            // an empty transcript). A cold-load 503 is intentionally NOT failed
+            // over.
+            record_served(stt_base);
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("stt backend returned {status}: {body}"));
+        }
+
+        match resp.json::<serde_json::Value>().await {
+            Ok(body) => {
+                record_served(stt_base);
+                let text = body
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let data = serde_json::json!({"text": text});
+                return Ok(make_event("transcript", Some(&data), &[]));
+            }
+            // Mid-body transport failure: nothing emitted to the client yet, so
+            // fail over to the next upstream like a connect error.
+            Err(e) if is_transport_failure(&e) && !is_last => {
+                warn!(error = %e, upstream = %stt_base, "wyoming stt response read failed mid-body, failing over");
+                record_fell_through(stt_base);
+                last_err = format!("stt backend read failed: {e}");
+                continue;
+            }
+            Err(e) => {
+                if is_transport_failure(&e) {
+                    record_fell_through(stt_base);
+                }
+                return Err(format!("invalid JSON from stt backend: {e}"));
+            }
+        }
     }
 
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("invalid JSON from stt backend: {e}"))?;
-
-    let text = body
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let data = serde_json::json!({"text": text});
-    Ok(make_event("transcript", Some(&data), &[]))
+    Err(if last_err.is_empty() {
+        "no STT upstream configured".to_string()
+    } else {
+        last_err
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +585,7 @@ async fn handle_connection(
 
             "audio-stop" => {
                 if let Some(ref session) = stt_session {
-                    match finish_stt(session, &config, &client).await {
+                    match finish_stt(session, &config, &client, &metrics).await {
                         Ok(transcript) => {
                             if let Err(e) = write_event(&mut write_half, &transcript).await {
                                 warn!(%addr, error = %e, "failed to send transcript");
@@ -956,5 +1016,151 @@ mod tests {
             parsed["version"], "1.0.0",
             "written events must include version field"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wyoming STT ordered-failover tests (Unit 3)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use axum::Router;
+    use axum::routing::post;
+    use prometheus_client::registry::Registry;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    async fn spawn_mock(status: u16, body: &'static str) -> (String, Arc<AtomicUsize>) {
+        let received = Arc::new(AtomicUsize::new(0));
+        let r = received.clone();
+        let app = Router::new().route(
+            "/upstream/whisper/v1/audio/transcriptions",
+            post(move |b: axum::body::Bytes| {
+                let r = r.clone();
+                async move {
+                    r.store(b.len(), Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    async fn closed_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a: SocketAddr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{a}")
+    }
+
+    fn cfg(bases: Vec<String>) -> Config {
+        Config {
+            stt_upstreams: bases,
+            tts_url: "http://localhost:1".to_string(),
+            stt_model: "whisper".to_string(),
+            stt_translate_model: "whisper-translate".to_string(),
+            speaches_url: None,
+            public_addr: "0.0.0.0:8000".parse().unwrap(),
+            wyoming_port: 10300,
+            internal_addr: "0.0.0.0:9090".parse().unwrap(),
+            default_tts_model: "kokoro".to_string(),
+            default_tts_voice: "af_heart".to_string(),
+        }
+    }
+
+    fn session() -> SttSession {
+        let mut s = SttSession::new("en".to_string());
+        s.pcm.extend_from_slice(&[0u8; 3200]); // ~0.1s of 16 kHz mono 16-bit PCM
+        s
+    }
+
+    #[tokio::test]
+    async fn wyoming_fails_over_with_full_body() {
+        let down = closed_addr().await;
+        let (up, received) = spawn_mock(200, r#"{"text":"hello wyoming"}"#).await;
+        let mut reg = Registry::default();
+        let metrics = Metrics::new(&mut reg);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let config = cfg(vec![down.clone(), up.clone()]);
+
+        let event = finish_stt(&session(), &config, &client, &metrics)
+            .await
+            .expect("transcript via failover");
+
+        let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
+        assert_eq!(event.header.event_type, "transcript");
+        assert_eq!(data["text"], "hello wyoming");
+        // The wav is cloned per attempt, so the surviving upstream gets the full body.
+        assert!(
+            received.load(Ordering::SeqCst) >= 3244,
+            "second upstream must receive the full re-materialised wav"
+        );
+        assert_eq!(
+            metrics
+                .stt_upstream_attempts
+                .get_or_create(&stt_upstream_labels(&down, "fell_through"))
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn wyoming_single_upstream_ok() {
+        let (up, received) = spawn_mock(200, r#"{"text":"solo"}"#).await;
+        let mut reg = Registry::default();
+        let metrics = Metrics::new(&mut reg);
+        let client = reqwest::Client::new();
+        let config = cfg(vec![up.clone()]);
+
+        let event = finish_stt(&session(), &config, &client, &metrics)
+            .await
+            .expect("transcript");
+        let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
+        assert_eq!(data["text"], "solo");
+        assert!(received.load(Ordering::SeqCst) >= 3244);
+    }
+
+    #[tokio::test]
+    async fn wyoming_all_upstreams_down_errors() {
+        // All upstreams unreachable -> finish_stt returns Err, which the caller
+        // (handle_connection) turns into the empty-transcript fallback + its
+        // metric. Every failed attempt is recorded.
+        let down1 = closed_addr().await;
+        let down2 = closed_addr().await;
+        let mut reg = Registry::default();
+        let metrics = Metrics::new(&mut reg);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let config = cfg(vec![down1.clone(), down2.clone()]);
+
+        let result = finish_stt(&session(), &config, &client, &metrics).await;
+        assert!(result.is_err(), "all upstreams down must return Err");
+
+        let ft = |base: &str| {
+            metrics
+                .stt_upstream_attempts
+                .get_or_create(&stt_upstream_labels(base, "fell_through"))
+                .get()
+        };
+        assert_eq!(ft(&down1), 1);
+        assert_eq!(ft(&down2), 1);
     }
 }

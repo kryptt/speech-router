@@ -95,6 +95,7 @@ async fn main() {
         stt_model: state.config.stt_model.clone(),
         stt_translate_model: state.config.stt_translate_model.clone(),
         client: state.client.clone(),
+        metrics: state.metrics.clone(),
     };
 
     let asr_router: Router<()> = Router::new()
@@ -191,25 +192,15 @@ async fn passthrough_route(
         );
     }
 
-    // Select the upstream by path: STT audio is rewritten onto the llama-swap
-    // /upstream/<model> path; TTS goes to Kokoro; anything else falls back to
-    // the legacy Speaches URL during the phase-out window.
+    // STT transcriptions are rewritten onto the llama-swap /upstream/<model>
+    // path and fail over across the ordered upstream list (plan 2026-06-02-003).
+    if path == "/v1/audio/transcriptions" {
+        return passthrough_transcriptions(&state, method, uri.query(), &headers, body).await;
+    }
+
+    // TTS goes to Kokoro; anything else falls back to the legacy Speaches URL
+    // during the phase-out window.
     let (backend_url, fwd_path): (String, String) = match path {
-        "/v1/audio/transcriptions" => match state.config.stt_upstreams.first() {
-            Some(base) => (
-                base.clone(),
-                format!(
-                    "/upstream/{}/v1/audio/transcriptions",
-                    state.config.stt_model
-                ),
-            ),
-            None => {
-                return proxy::error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "no STT upstream configured",
-                );
-            }
-        },
         "/v1/audio/speech" => (state.config.tts_url.clone(), path.to_string()),
         _ => match &state.config.speaches_url {
             Some(u) => (u.clone(), path.to_string()),
@@ -234,6 +225,77 @@ async fn passthrough_route(
     .await
 }
 
+/// Proxy a `/v1/audio/transcriptions` request, failing over across the ordered
+/// STT upstreams. Only a transport-level failure on a non-final upstream
+/// triggers failover; any HTTP response is returned as-is (plan
+/// 2026-06-02-003, R3). The request body is cheap to clone (`Bytes` is
+/// reference-counted) so each attempt re-sends the full payload.
+async fn passthrough_transcriptions(
+    state: &AppState,
+    method: Method,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    if state.config.stt_upstreams.is_empty() {
+        return proxy::error_response(StatusCode::BAD_GATEWAY, "no STT upstream configured");
+    }
+    let fwd_path = format!(
+        "/upstream/{}/v1/audio/transcriptions",
+        state.config.stt_model
+    );
+    let last_idx = state.config.stt_upstreams.len() - 1;
+
+    for (idx, base) in state.config.stt_upstreams.iter().enumerate() {
+        let is_last = idx == last_idx;
+        let result = proxy::try_forward(proxy::ProxyRequest {
+            client: &state.client,
+            backend_url: base,
+            path: &fwd_path,
+            query,
+            method: method.clone(),
+            headers,
+            body: body.clone(),
+        })
+        .await;
+
+        match result {
+            Ok(resp) => {
+                state
+                    .metrics
+                    .stt_upstream_attempts
+                    .get_or_create(&metrics::stt_upstream_labels(base, "served"))
+                    .inc();
+                return resp;
+            }
+            Err(e) if proxy::is_transport_failure(&e) && !is_last => {
+                tracing::warn!(error = %e, upstream = %base, "passthrough stt upstream unreachable, failing over");
+                state
+                    .metrics
+                    .stt_upstream_attempts
+                    .get_or_create(&metrics::stt_upstream_labels(base, "fell_through"))
+                    .inc();
+                continue;
+            }
+            Err(e) => {
+                // Record the final upstream's transport failure too, so the
+                // metric reflects every failed attempt.
+                if proxy::is_transport_failure(&e) {
+                    state
+                        .metrics
+                        .stt_upstream_attempts
+                        .get_or_create(&metrics::stt_upstream_labels(base, "fell_through"))
+                        .inc();
+                }
+                tracing::warn!(error = %e, upstream = %base, "passthrough stt request failed");
+                return proxy::error_response(StatusCode::BAD_GATEWAY, "upstream unavailable");
+            }
+        }
+    }
+
+    proxy::error_response(StatusCode::BAD_GATEWAY, "no STT upstream configured")
+}
+
 /// Synthesize a minimal OpenAI `/v1/models` listing for the audio models so
 /// OpenAI-compatible clients (e.g. Open WebUI) can validate the connection
 /// without a Speaches backend.
@@ -253,48 +315,50 @@ fn models_response(config: &Config) -> Response {
 // ---------------------------------------------------------------------------
 
 async fn health_route(State(state): State<AppState>) -> Response {
-    // Probe the STT backend's llama-swap model list (which does NOT trigger a
+    // Probe the STT backends' llama-swap model lists (which do NOT trigger a
     // model load) so readiness reflects STT availability without depending on
     // Speaches. TTS (Kokoro) is intentionally not gated here.
-    let Some(base) = state.config.stt_upstreams.first() else {
+    //
+    // Healthy if ANY configured upstream responds: speech-router can serve STT
+    // via failover, so readiness must not be gated on the primary alone. If it
+    // were, a primary (rh-anine) outage would fail the readiness probe and pull
+    // speech-router out of its Service endpoints — a total STT outage that
+    // *defeats* the CUDA failover (plan 2026-06-02-003). We only report
+    // unhealthy when every upstream is unreachable.
+    if state.config.stt_upstreams.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(json!({"status": "unhealthy", "reason": "no STT upstream configured"})),
         )
             .into_response();
-    };
-    let check_url = format!("{base}/v1/models");
-
-    match state
-        .client
-        .get(&check_url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            (StatusCode::OK, axum::Json(json!({"status": "ok"}))).into_response()
-        }
-        Ok(resp) => {
-            let status = resp.status();
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({
-                    "status": "unhealthy",
-                    "reason": format!("stt backend returned {status}")
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(json!({
-                "status": "unhealthy",
-                "reason": format!("stt backend unreachable: {e}")
-            })),
-        )
-            .into_response(),
     }
+
+    let mut reasons: Vec<String> = Vec::new();
+    for base in &state.config.stt_upstreams {
+        let check_url = format!("{base}/v1/models");
+        match state
+            .client
+            .get(&check_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                return (StatusCode::OK, axum::Json(json!({"status": "ok"}))).into_response();
+            }
+            Ok(resp) => reasons.push(format!("{base} returned {}", resp.status())),
+            Err(e) => reasons.push(format!("{base} unreachable: {e}")),
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(json!({
+            "status": "unhealthy",
+            "reason": format!("all STT upstreams unavailable: {}", reasons.join("; "))
+        })),
+    )
+        .into_response()
 }
 
 async fn status_route() -> Response {
@@ -317,5 +381,158 @@ async fn metrics_route(State(state): State<AppState>) -> Response {
         )
             .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough STT failover tests (Unit 3) — the OpenAI-compatible
+// /v1/audio/transcriptions path used by Open WebUI.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod passthrough_failover_tests {
+    use super::*;
+    use axum::routing::post;
+    use prometheus_client::registry::Registry;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    async fn spawn_mock(status: u16) -> (String, Arc<AtomicUsize>) {
+        let received = Arc::new(AtomicUsize::new(0));
+        let r = received.clone();
+        let app = axum::Router::new().route(
+            "/upstream/whisper/v1/audio/transcriptions",
+            post(move |b: Bytes| {
+                let r = r.clone();
+                async move {
+                    r.store(b.len(), Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"text":"ok"}"#))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    async fn closed_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a: SocketAddr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{a}")
+    }
+
+    fn app_state(bases: Vec<String>) -> AppState {
+        let config = Config {
+            stt_upstreams: bases,
+            tts_url: "http://localhost:1".to_string(),
+            stt_model: "whisper".to_string(),
+            stt_translate_model: "whisper-translate".to_string(),
+            speaches_url: None,
+            public_addr: "0.0.0.0:8000".parse().unwrap(),
+            wyoming_port: 10300,
+            internal_addr: "0.0.0.0:9090".parse().unwrap(),
+            default_tts_model: "kokoro".to_string(),
+            default_tts_voice: "af_heart".to_string(),
+        };
+        let mut registry = Registry::default();
+        let metrics = Arc::new(Metrics::new(&mut registry));
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
+        AppState {
+            config: Arc::new(config),
+            client,
+            metrics,
+            registry: Arc::new(registry),
+        }
+    }
+
+    fn fell_through(state: &AppState, base: &str) -> u64 {
+        state
+            .metrics
+            .stt_upstream_attempts
+            .get_or_create(&metrics::stt_upstream_labels(base, "fell_through"))
+            .get()
+    }
+
+    #[tokio::test]
+    async fn passthrough_fails_over_to_second_upstream() {
+        let down = closed_addr().await;
+        let (up, received) = spawn_mock(200).await;
+        let state = app_state(vec![down.clone(), up.clone()]);
+
+        let resp = passthrough_transcriptions(
+            &state,
+            Method::POST,
+            None,
+            &HeaderMap::new(),
+            Bytes::from_static(&[7u8; 1500]),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            received.load(Ordering::SeqCst) >= 1500,
+            "second upstream must receive the full re-sent body"
+        );
+        assert_eq!(fell_through(&state, &down), 1);
+    }
+
+    #[tokio::test]
+    async fn passthrough_all_down_is_bad_gateway() {
+        let down1 = closed_addr().await;
+        let down2 = closed_addr().await;
+        let state = app_state(vec![down1.clone(), down2.clone()]);
+
+        let resp = passthrough_transcriptions(
+            &state,
+            Method::POST,
+            None,
+            &HeaderMap::new(),
+            Bytes::from_static(&[0u8; 64]),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // every failed attempt is recorded, including the final upstream
+        assert_eq!(fell_through(&state, &down1), 1);
+        assert_eq!(fell_through(&state, &down2), 1);
+    }
+
+    #[tokio::test]
+    async fn passthrough_503_is_not_failed_over() {
+        let (busy, busy_recv) = spawn_mock(503).await;
+        let (backup, backup_recv) = spawn_mock(200).await;
+        let state = app_state(vec![busy.clone(), backup.clone()]);
+
+        let resp = passthrough_transcriptions(
+            &state,
+            Method::POST,
+            None,
+            &HeaderMap::new(),
+            Bytes::from_static(&[0u8; 64]),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(busy_recv.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            backup_recv.load(Ordering::SeqCst),
+            0,
+            "a 503 must not trigger failover"
+        );
     }
 }

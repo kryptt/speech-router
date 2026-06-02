@@ -13,7 +13,8 @@ use tokio::sync::Semaphore;
 use futures_util::TryStreamExt;
 
 use crate::ffmpeg::{self, AudioTrack};
-use crate::proxy::error_response;
+use crate::metrics::{Metrics, stt_upstream_labels};
+use crate::proxy::{error_response, is_transport_failure};
 use crate::wyoming::wav_header;
 
 // ---------------------------------------------------------------------------
@@ -290,6 +291,7 @@ pub struct AsrState {
     /// translate, so this is a separate non-turbo model).
     pub stt_translate_model: String,
     pub client: std::sync::Arc<reqwest::Client>,
+    pub metrics: std::sync::Arc<Metrics>,
 }
 
 // ---------------------------------------------------------------------------
@@ -332,16 +334,12 @@ pub async fn handle_asr(
         .filter(|l| !l.is_empty())
         .unwrap_or("en");
 
-    // v1 uses the first STT upstream. (Ordered-list failover is a fast-follow.)
-    let stt_base = match state.stt_upstreams.first() {
-        Some(b) => b.as_str(),
-        None => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "no STT upstream configured",
-            );
-        }
-    };
+    if state.stt_upstreams.is_empty() {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no STT upstream configured",
+        );
+    }
 
     match select_and_transcribe(
         &audio.temp_path,
@@ -351,8 +349,9 @@ pub async fn handle_asr(
         response_format,
         &state.stt_model,
         &state.stt_translate_model,
-        stt_base,
+        &state.stt_upstreams,
         &state.client,
+        &state.metrics,
     )
     .await
     {
@@ -370,6 +369,7 @@ pub async fn handle_asr(
 /// Speaches.
 ///
 /// Returns the final HTTP response on success, or a 500 error response.
+#[allow(clippy::too_many_arguments)]
 async fn select_and_transcribe(
     file_path: &Path,
     file_name: &str,
@@ -378,8 +378,9 @@ async fn select_and_transcribe(
     response_format: &str,
     model: &str,
     translate_model: &str,
-    stt_base: &str,
+    stt_bases: &[String],
     client: &reqwest::Client,
+    metrics: &Metrics,
 ) -> Result<Response, Response> {
     if ffmpeg::is_video_file(file_name) {
         select_and_transcribe_video(
@@ -389,8 +390,9 @@ async fn select_and_transcribe(
             response_format,
             model,
             translate_model,
-            stt_base,
+            stt_bases,
             client,
+            metrics,
         )
         .await
     } else {
@@ -401,15 +403,23 @@ async fn select_and_transcribe(
             response_format,
             model,
             translate_model,
-            stt_base,
+            stt_bases,
             client,
+            metrics,
         )
         .await
     }
 }
 
+/// The primary STT upstream — language detection always uses this one; failover
+/// applies only to the transcribe/translate call (plan 2026-06-02-003).
+fn primary_base(stt_bases: &[String]) -> &str {
+    stt_bases.first().map(String::as_str).unwrap_or_default()
+}
+
 /// Handle a video file: probe tracks, try the language-matched track first,
 /// fall back to track 0, then give up.
+#[allow(clippy::too_many_arguments)]
 async fn select_and_transcribe_video(
     video_path: &Path,
     requested_lang: &str,
@@ -417,9 +427,11 @@ async fn select_and_transcribe_video(
     response_format: &str,
     model: &str,
     translate_model: &str,
-    stt_base: &str,
+    stt_bases: &[String],
     client: &reqwest::Client,
+    metrics: &Metrics,
 ) -> Result<Response, Response> {
+    let stt_base = primary_base(stt_bases);
     let video_path_owned = video_path.to_path_buf();
     let tracks = tokio::task::spawn_blocking(move || ffmpeg::probe_audio_tracks(&video_path_owned))
         .await
@@ -485,15 +497,16 @@ async fn select_and_transcribe_video(
 
         match decide_task(requested_lang, &detected) {
             TaskDecision::Transcribe { language } => {
-                return send_to_speaches(
+                return send_with_failover(
                     &audio.temp_path,
                     &language,
                     AsrTask::Transcribe,
                     output,
                     response_format,
                     model,
-                    stt_base,
+                    stt_bases,
                     client,
+                    metrics,
                 )
                 .await;
             }
@@ -501,15 +514,16 @@ async fn select_and_transcribe_video(
                 // Whisper translate always targets English; pass the detected
                 // language as the source, and use the dedicated translate model
                 // (turbo can't translate).
-                return send_to_speaches(
+                return send_with_failover(
                     &audio.temp_path,
                     &detected,
                     AsrTask::Translate,
                     output,
                     response_format,
                     translate_model,
-                    stt_base,
+                    stt_bases,
                     client,
+                    metrics,
                 )
                 .await;
             }
@@ -534,6 +548,7 @@ async fn select_and_transcribe_video(
 }
 
 /// Handle a plain audio file (single track): detect language, decide task.
+#[allow(clippy::too_many_arguments)]
 async fn select_and_transcribe_audio(
     audio_path: &Path,
     requested_lang: &str,
@@ -541,9 +556,11 @@ async fn select_and_transcribe_audio(
     response_format: &str,
     model: &str,
     translate_model: &str,
-    stt_base: &str,
+    stt_bases: &[String],
     client: &reqwest::Client,
+    metrics: &Metrics,
 ) -> Result<Response, Response> {
+    let stt_base = primary_base(stt_bases);
     let detected = detect_language_from_file(stt_base, model, client, audio_path)
         .await
         .map_err(|e| {
@@ -562,28 +579,30 @@ async fn select_and_transcribe_audio(
 
     match decide_task(requested_lang, &detected) {
         TaskDecision::Transcribe { language } => {
-            send_to_speaches(
+            send_with_failover(
                 audio_path,
                 &language,
                 AsrTask::Transcribe,
                 output,
                 response_format,
                 model,
-                stt_base,
+                stt_bases,
                 client,
+                metrics,
             )
             .await
         }
         TaskDecision::Translate => {
-            send_to_speaches(
+            send_with_failover(
                 audio_path,
                 &detected,
                 AsrTask::Translate,
                 output,
                 response_format,
                 translate_model,
-                stt_base,
+                stt_bases,
                 client,
+                metrics,
             )
             .await
         }
@@ -595,21 +614,19 @@ async fn select_and_transcribe_audio(
 }
 
 // ---------------------------------------------------------------------------
-// Speaches request builder
+// Speaches request builder + ordered failover
 // ---------------------------------------------------------------------------
 
-/// Build and send a transcription/translation request to Speaches, returning
-/// the formatted HTTP response.
-async fn send_to_speaches(
+/// Build a fresh transcription/translation multipart form, reopening the audio
+/// file each time. A `reqwest` body stream is single-use, so every failover
+/// attempt needs its own `Form` built from a newly-opened file handle.
+async fn build_transcription_form(
     audio_path: &Path,
     language: &str,
     task: AsrTask,
-    output: AsrOutput,
     response_format: &str,
     model: &str,
-    stt_base: &str,
-    client: &reqwest::Client,
-) -> Result<Response, Response> {
+) -> Result<reqwest::multipart::Form, Response> {
     let file = tokio::fs::File::open(audio_path).await.map_err(|e| {
         tracing::warn!(error = %e, "failed to open audio file for stt backend");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
@@ -635,42 +652,127 @@ async fn send_to_speaches(
         // separate /v1/audio/translations route.
         form = form.text("translate", "true");
     }
+    Ok(form)
+}
 
-    let url = transcription_url(stt_base, model);
+/// Send a transcription/translation request to the STT backend, failing over
+/// through `stt_bases` in order, and return the formatted HTTP response.
+///
+/// Failover triggers ONLY on a transport-level failure (see
+/// [`is_transport_failure`]): if an upstream returns any HTTP response it is
+/// considered alive and that response is surfaced as-is — so a broken-but-
+/// responding node is never masked and a llama-swap cold-load 503 is never
+/// mistaken for an outage (plan 2026-06-02-003, R3). Each attempt rebuilds the
+/// multipart form from a freshly-opened file. A per-upstream `served` /
+/// `fell_through` metric records the outcome.
+#[allow(clippy::too_many_arguments)]
+async fn send_with_failover(
+    audio_path: &Path,
+    language: &str,
+    task: AsrTask,
+    output: AsrOutput,
+    response_format: &str,
+    model: &str,
+    stt_bases: &[String],
+    client: &reqwest::Client,
+    metrics: &Metrics,
+) -> Result<Response, Response> {
+    let last_idx = stt_bases.len().saturating_sub(1);
 
-    let upstream = client
-        .post(&url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "stt backend request failed");
-            error_response(StatusCode::BAD_GATEWAY, "upstream unavailable")
-        })?;
+    for (idx, stt_base) in stt_bases.iter().enumerate() {
+        let is_last = idx == last_idx;
+        let form =
+            build_transcription_form(audio_path, language, task, response_format, model).await?;
+        let url = transcription_url(stt_base, model);
 
-    let status = StatusCode::from_u16(upstream.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let record_fell_through = |stt_base: &str| {
+            metrics
+                .stt_upstream_attempts
+                .get_or_create(&stt_upstream_labels(stt_base, "fell_through"))
+                .inc();
+        };
 
-    let body = upstream.bytes().await.map_err(|e| {
-        tracing::warn!(error = %e, "failed to read stt backend response body");
-        error_response(StatusCode::BAD_GATEWAY, "failed to read upstream response")
-    })?;
+        match client.post(&url).multipart(form).send().await {
+            Ok(upstream) => {
+                let status = StatusCode::from_u16(upstream.status().as_u16())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    let content_type = content_type_for(output);
-    let mut response = (status, body).into_response();
-    response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type),
-    );
+                match upstream.bytes().await {
+                    Ok(body) => {
+                        // Record `served` only once the full response body has
+                        // arrived — a send that succeeds but whose body read
+                        // fails was not actually served.
+                        metrics
+                            .stt_upstream_attempts
+                            .get_or_create(&stt_upstream_labels(stt_base, "served"))
+                            .inc();
 
-    if output == AsrOutput::Srt {
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_DISPOSITION,
-            HeaderValue::from_static("attachment; filename=\"transcription.srt\""),
-        );
+                        let content_type = content_type_for(output);
+                        let mut response = (status, body).into_response();
+                        response.headers_mut().insert(
+                            axum::http::header::CONTENT_TYPE,
+                            HeaderValue::from_static(content_type),
+                        );
+                        if output == AsrOutput::Srt {
+                            response.headers_mut().insert(
+                                axum::http::header::CONTENT_DISPOSITION,
+                                HeaderValue::from_static(
+                                    "attachment; filename=\"transcription.srt\"",
+                                ),
+                            );
+                        }
+                        return Ok(response);
+                    }
+                    // A mid-body transport failure (upstream accepted the
+                    // connection then reset/timed out) is still a dead-upstream
+                    // signal. Nothing has been sent to the client yet — the body
+                    // is buffered here, not streamed — so fail over like a
+                    // connect error rather than returning a 502.
+                    Err(e) if is_transport_failure(&e) && !is_last => {
+                        tracing::warn!(error = %e, upstream = %stt_base, "stt response read failed mid-body, failing over to next");
+                        record_fell_through(stt_base);
+                        continue;
+                    }
+                    Err(e) => {
+                        if is_transport_failure(&e) {
+                            record_fell_through(stt_base);
+                        }
+                        tracing::warn!(error = %e, upstream = %stt_base, "failed to read stt backend response body");
+                        return Err(error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "failed to read upstream response",
+                        ));
+                    }
+                }
+            }
+            Err(e) if is_transport_failure(&e) && !is_last => {
+                tracing::warn!(
+                    error = %e, upstream = %stt_base,
+                    "stt upstream unreachable, failing over to next"
+                );
+                record_fell_through(stt_base);
+                continue;
+            }
+            Err(e) => {
+                // Record the final upstream's transport failure too, so the
+                // metric reflects every failed attempt (not just fell-overs).
+                if is_transport_failure(&e) {
+                    record_fell_through(stt_base);
+                }
+                tracing::warn!(error = %e, upstream = %stt_base, "stt backend request failed");
+                return Err(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream unavailable",
+                ));
+            }
+        }
     }
 
-    Ok(response)
+    // Reachable only if stt_bases is empty (handlers guard against this first).
+    Err(error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "no STT upstream configured",
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,5 +1369,201 @@ mod tests {
         assert_eq!(normalize_language_code("klingon"), None);
         assert_eq!(normalize_language_code(""), None);
         assert_eq!(normalize_language_code("   "), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ordered STT failover tests (Unit 3) — spin minimal local mock STT servers
+// (axum is already a dependency) to exercise send_with_failover end-to-end.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use axum::Router;
+    use axum::routing::post;
+    use prometheus_client::registry::Registry;
+    use std::io::Write;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+
+    /// Spawn a mock STT server that records (received body length, hit count)
+    /// and replies with `status` + `body`. Returns its base URL.
+    async fn spawn_mock(
+        status: u16,
+        body: &'static str,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let received = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let r = received.clone();
+        let h = hits.clone();
+
+        let app = Router::new().route(
+            "/upstream/whisper/v1/audio/transcriptions",
+            post(move |b: axum::body::Bytes| {
+                let r = r.clone();
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    r.store(b.len(), Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), received, hits)
+    }
+
+    /// A base URL whose port is bound then released — connecting refuses, which
+    /// is the transport failure that triggers failover.
+    async fn closed_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a: SocketAddr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{a}")
+    }
+
+    fn audio_temp() -> tempfile::TempPath {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0u8; 2048]).unwrap();
+        f.into_temp_path()
+    }
+
+    fn test_metrics() -> Metrics {
+        let mut reg = Registry::default();
+        Metrics::new(&mut reg)
+    }
+
+    fn served(m: &Metrics, base: &str) -> u64 {
+        m.stt_upstream_attempts
+            .get_or_create(&stt_upstream_labels(base, "served"))
+            .get()
+    }
+    fn fell_through(m: &Metrics, base: &str) -> u64 {
+        m.stt_upstream_attempts
+            .get_or_create(&stt_upstream_labels(base, "fell_through"))
+            .get()
+    }
+
+    async fn run(
+        bases: &[String],
+        client: &reqwest::Client,
+        metrics: &Metrics,
+    ) -> Result<Response, Response> {
+        let audio = audio_temp();
+        send_with_failover(
+            &audio,
+            "en",
+            AsrTask::Transcribe,
+            AsrOutput::Json,
+            "verbose_json",
+            "whisper",
+            bases,
+            client,
+            metrics,
+        )
+        .await
+    }
+
+    // axum's Response<Body> is not Debug, so Result::expect can't be used.
+    fn ok_status(r: Result<Response, Response>) -> StatusCode {
+        match r {
+            Ok(resp) => resp.status(),
+            Err(_) => panic!("expected Ok response, got Err"),
+        }
+    }
+    fn err_status(r: Result<Response, Response>) -> StatusCode {
+        match r {
+            Ok(_) => panic!("expected Err response, got Ok"),
+            Err(resp) => resp.status(),
+        }
+    }
+
+    #[tokio::test]
+    async fn happy_single_upstream_no_failover() {
+        let (base, received, hits) = spawn_mock(200, r#"{"text":"hello"}"#).await;
+        let metrics = test_metrics();
+        let client = reqwest::Client::new();
+
+        let status = ok_status(run(std::slice::from_ref(&base), &client, &metrics).await);
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(received.load(Ordering::SeqCst) >= 2048, "got the full body");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(served(&metrics, &base), 1);
+        assert_eq!(fell_through(&metrics, &base), 0);
+    }
+
+    #[tokio::test]
+    async fn fails_over_to_second_upstream_with_full_body() {
+        let down = closed_addr().await;
+        let (up, received, hits) = spawn_mock(200, r#"{"text":"hi"}"#).await;
+        let metrics = test_metrics();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let status = ok_status(run(&[down.clone(), up.clone()], &client, &metrics).await);
+
+        assert_eq!(status, StatusCode::OK);
+        // The key correctness property: the body is re-materialised for the
+        // retry, so the second upstream receives the full payload (not empty).
+        assert!(
+            received.load(Ordering::SeqCst) >= 2048,
+            "second upstream must receive the full re-materialised body"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fell_through(&metrics, &down), 1);
+        assert_eq!(served(&metrics, &up), 1);
+    }
+
+    #[tokio::test]
+    async fn loading_503_is_not_failed_over() {
+        // A 503 is a real HTTP response → the node is alive → return it as-is,
+        // do NOT try the backup (don't mistake a cold-load for an outage).
+        let (busy, _r, busy_hits) = spawn_mock(503, r#"{"error":"loading"}"#).await;
+        let (backup, _br, backup_hits) = spawn_mock(200, r#"{"text":"x"}"#).await;
+        let metrics = test_metrics();
+        let client = reqwest::Client::new();
+
+        let status = ok_status(run(&[busy.clone(), backup.clone()], &client, &metrics).await);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            0,
+            "must not fail over on a 503 response"
+        );
+        assert_eq!(served(&metrics, &busy), 1);
+        assert_eq!(fell_through(&metrics, &busy), 0);
+    }
+
+    #[tokio::test]
+    async fn all_upstreams_down_returns_bad_gateway() {
+        let down1 = closed_addr().await;
+        let down2 = closed_addr().await;
+        let metrics = test_metrics();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let status = err_status(run(&[down1.clone(), down2.clone()], &client, &metrics).await);
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(fell_through(&metrics, &down1), 1);
     }
 }
