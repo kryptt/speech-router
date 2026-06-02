@@ -283,8 +283,12 @@ fn find_track_by_language<'a>(tracks: &'a [AudioTrack], lang: &str) -> Option<&'
 pub struct AsrState {
     /// Ordered llama-swap STT upstreams; v1 uses the first entry.
     pub stt_upstreams: Vec<String>,
-    /// llama-swap model id used in the `/upstream/{model}` path.
+    /// llama-swap model id used in the `/upstream/{model}` path
+    /// (transcription + language detection).
     pub stt_model: String,
+    /// Model id for the translate-to-English task (whisper turbo can't
+    /// translate, so this is a separate non-turbo model).
+    pub stt_translate_model: String,
     pub client: std::sync::Arc<reqwest::Client>,
 }
 
@@ -346,6 +350,7 @@ pub async fn handle_asr(
         params.output,
         response_format,
         &state.stt_model,
+        &state.stt_translate_model,
         stt_base,
         &state.client,
     )
@@ -372,6 +377,7 @@ async fn select_and_transcribe(
     output: AsrOutput,
     response_format: &str,
     model: &str,
+    translate_model: &str,
     stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
@@ -382,6 +388,7 @@ async fn select_and_transcribe(
             output,
             response_format,
             model,
+            translate_model,
             stt_base,
             client,
         )
@@ -393,6 +400,7 @@ async fn select_and_transcribe(
             output,
             response_format,
             model,
+            translate_model,
             stt_base,
             client,
         )
@@ -408,6 +416,7 @@ async fn select_and_transcribe_video(
     output: AsrOutput,
     response_format: &str,
     model: &str,
+    translate_model: &str,
     stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
@@ -490,14 +499,15 @@ async fn select_and_transcribe_video(
             }
             TaskDecision::Translate => {
                 // Whisper translate always targets English; pass the detected
-                // language so Whisper knows the source.
+                // language as the source, and use the dedicated translate model
+                // (turbo can't translate).
                 return send_to_speaches(
                     &audio.temp_path,
                     &detected,
                     AsrTask::Translate,
                     output,
                     response_format,
-                    model,
+                    translate_model,
                     stt_base,
                     client,
                 )
@@ -530,6 +540,7 @@ async fn select_and_transcribe_audio(
     output: AsrOutput,
     response_format: &str,
     model: &str,
+    translate_model: &str,
     stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
@@ -570,7 +581,7 @@ async fn select_and_transcribe_audio(
                 AsrTask::Translate,
                 output,
                 response_format,
-                model,
+                translate_model,
                 stt_base,
                 client,
             )

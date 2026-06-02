@@ -839,6 +839,7 @@ mod tests {
             stt_upstreams: vec!["http://localhost:8080".to_string()],
             tts_url: "http://localhost:8080".to_string(),
             stt_model: "whisper".to_string(),
+            stt_translate_model: "whisper-translate".to_string(),
             speaches_url: None,
             public_addr: "0.0.0.0:8000".parse().unwrap(),
             wyoming_port: 10300,

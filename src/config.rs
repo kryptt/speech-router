@@ -13,8 +13,13 @@ pub struct Config {
     pub stt_upstreams: Vec<String>,
     /// TTS upstream base URL (Kokoro-FastAPI), e.g. `http://kokoro-fastapi.ai:8080`.
     pub tts_url: String,
-    /// The llama-swap model id used in the `/upstream/{model}` STT path.
+    /// The llama-swap model id used in the `/upstream/{model}` STT path
+    /// (transcription + language detection).
     pub stt_model: String,
+    /// Model id for the translate-to-English task. whisper turbo is
+    /// transcription-only, so translation routes to a separate (non-turbo)
+    /// model. Defaults to `stt_model` when unset.
+    pub stt_translate_model: String,
     /// Legacy Speaches base URL, retained only as a fallback for any upstream
     /// left unset during the phase-out window. `None` once fully migrated.
     pub speaches_url: Option<String>,
@@ -65,6 +70,10 @@ impl Config {
             .or_else(|| env::var("DEFAULT_MODEL").ok())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "whisper".to_string());
+        let stt_translate_model = env::var("STT_TRANSLATE_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| stt_model.clone());
         let default_tts_model =
             env::var("DEFAULT_TTS_MODEL").unwrap_or_else(|_| "kokoro".to_string());
         let default_tts_voice =
@@ -74,6 +83,7 @@ impl Config {
             stt_upstreams,
             tts_url,
             stt_model,
+            stt_translate_model,
             speaches_url,
             public_addr: SocketAddr::from(([0, 0, 0, 0], public_port)),
             wyoming_port,
@@ -165,6 +175,7 @@ mod tests {
         "STT_URLS",
         "TTS_URL",
         "STT_MODEL",
+        "STT_TRANSLATE_MODEL",
         "SPEACHES_URL",
         "PUBLIC_PORT",
         "WYOMING_PORT",
@@ -203,6 +214,8 @@ mod tests {
                 );
                 assert_eq!(config.tts_url, "http://kokoro:8080");
                 assert_eq!(config.stt_model, "whisper");
+                // translate model defaults to stt_model when unset
+                assert_eq!(config.stt_translate_model, "whisper");
                 assert_eq!(config.speaches_url, None);
                 assert_eq!(config.public_addr.port(), 8000);
                 assert_eq!(config.wyoming_port, 10300);
@@ -240,6 +253,26 @@ mod tests {
             assert_eq!(config.internal_addr.port(), 7002);
             assert_eq!(config.default_tts_model, "piper");
             assert_eq!(config.default_tts_voice, "en_US");
+        });
+    }
+
+    #[test]
+    fn stt_translate_model_override_and_fallback() {
+        with_env(&[("STT_URLS", "x")], || {
+            clear_all();
+            unsafe {
+                env::set_var("STT_URLS", "http://llama-swap:8080");
+                env::set_var("TTS_URL", "http://kokoro:8080");
+                env::set_var("STT_MODEL", "whisper");
+                env::set_var("STT_TRANSLATE_MODEL", "whisper-translate");
+            }
+            let c = Config::from_env().expect("parse");
+            assert_eq!(c.stt_model, "whisper");
+            assert_eq!(c.stt_translate_model, "whisper-translate");
+            // unset -> falls back to stt_model
+            unsafe { env::remove_var("STT_TRANSLATE_MODEL") };
+            let c2 = Config::from_env().expect("parse");
+            assert_eq!(c2.stt_translate_model, "whisper");
         });
     }
 

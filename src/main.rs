@@ -93,6 +93,7 @@ async fn main() {
     let asr_state = AsrState {
         stt_upstreams: state.config.stt_upstreams.clone(),
         stt_model: state.config.stt_model.clone(),
+        stt_translate_model: state.config.stt_translate_model.clone(),
         client: state.client.clone(),
     };
 
