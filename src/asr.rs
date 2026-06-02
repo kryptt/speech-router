@@ -440,12 +440,14 @@ async fn detect_language_with_failover(
     model: &str,
     states: &NodeStates,
     client: &reqwest::Client,
+    metrics: &Metrics,
     audio_path: &Path,
 ) -> Result<String, String> {
     // Reorder the upstream list by current node state (R1–R4); detection uses
     // the STT model. The result is a permutation of `stt_bases`, so every
     // upstream is still tried — state only chooses the starting order (R5).
-    let (order, _decision) = ordered_upstreams(stt_bases, states, model);
+    let (order, decision) = ordered_upstreams(stt_bases, states, model);
+    metrics.record_routing_decision(decision);
 
     let mut last_err = "no STT upstream configured".to_string();
     for base in &order {
@@ -521,16 +523,22 @@ async fn select_and_transcribe_video(
     for track_index in attempts {
         let audio = extract_video_audio_track(video_path, track_index).await?;
 
-        let detected =
-            detect_language_with_failover(stt_bases, model, states, client, &audio.temp_path)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "language detection failed");
-                    error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "language detection failed",
-                    )
-                })?;
+        let detected = detect_language_with_failover(
+            stt_bases,
+            model,
+            states,
+            client,
+            metrics,
+            &audio.temp_path,
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "language detection failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "language detection failed",
+            )
+        })?;
 
         tracing::info!(
             ?track_index,
@@ -607,15 +615,16 @@ async fn select_and_transcribe_audio(
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Response, Response> {
-    let detected = detect_language_with_failover(stt_bases, model, states, client, audio_path)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "language detection failed");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "language detection failed",
-            )
-        })?;
+    let detected =
+        detect_language_with_failover(stt_bases, model, states, client, metrics, audio_path)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "language detection failed");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "language detection failed",
+                )
+            })?;
 
     tracing::info!(
         detected_lang = %detected,
@@ -729,7 +738,8 @@ async fn send_with_failover(
     // Reorder by current node state for the model actually requested (transcribe
     // vs translate may differ). A permutation of `stt_bases` — the loop still
     // iterates every upstream, so the transport-failover floor is unchanged (R5).
-    let (order, _decision) = ordered_upstreams(stt_bases, states, model);
+    let (order, decision) = ordered_upstreams(stt_bases, states, model);
+    metrics.record_routing_decision(decision);
     let last_idx = order.len().saturating_sub(1);
 
     for (idx, stt_base) in order.iter().enumerate() {
@@ -864,6 +874,7 @@ pub async fn handle_detect_language(
         &state.stt_model,
         &snapshot,
         &state.client,
+        &state.metrics,
         &audio.temp_path,
     )
     .await
@@ -1653,9 +1664,11 @@ mod failover_tests {
 
         let bases = vec![down, up];
         let states = NodeStates::new();
-        let lang = detect_language_with_failover(&bases, "whisper", &states, &client, &path)
-            .await
-            .expect("detection fails over to the healthy upstream");
+        let metrics = test_metrics();
+        let lang =
+            detect_language_with_failover(&bases, "whisper", &states, &client, &metrics, &path)
+                .await
+                .expect("detection fails over to the healthy upstream");
         assert_eq!(lang, "en");
     }
 

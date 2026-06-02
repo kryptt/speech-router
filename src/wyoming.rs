@@ -326,7 +326,8 @@ async fn finish_stt(
     }
     // Reorder by current node state (R1–R4); a permutation of stt_upstreams, so
     // the transport-failover loop below still tries every upstream (R5).
-    let (order, _decision) = ordered_upstreams(&config.stt_upstreams, states, &config.stt_model);
+    let (order, decision) = ordered_upstreams(&config.stt_upstreams, states, &config.stt_model);
+    metrics.record_routing_decision(decision);
     let last_idx = order.len() - 1;
 
     let mut last_err = String::new();

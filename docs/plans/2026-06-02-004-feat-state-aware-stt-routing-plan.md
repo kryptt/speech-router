@@ -300,7 +300,7 @@ permutation of the input.
 **Verification:** path tests assert first-contacted upstream matches the snapshot-driven order;
 existing plan-003/0.5.1 failover + detection-failover tests still pass unchanged.
 
-- [ ] **Unit 4: Routing-decision metric + debug visibility**
+- [x] **Unit 4: Routing-decision metric + debug visibility**
 
 **Goal:** Make routing decisions observable.
 

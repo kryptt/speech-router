@@ -263,11 +263,12 @@ async fn passthrough_transcriptions(
     // Reorder by current node state (R1–R4); a permutation of stt_upstreams, so
     // the transport-failover loop still tries every upstream (R5).
     let snapshot = state.node_states.load_full();
-    let (order, _decision) = node_state::ordered_upstreams(
+    let (order, decision) = node_state::ordered_upstreams(
         &state.config.stt_upstreams,
         &snapshot,
         &state.config.stt_model,
     );
+    state.metrics.record_routing_decision(decision);
     let last_idx = order.len() - 1;
 
     for (idx, base) in order.iter().enumerate() {

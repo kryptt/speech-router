@@ -26,6 +26,13 @@ pub struct Metrics {
     /// and traffic is failing over (plan 2026-06-02-003, R3) — it must not be
     /// allowed to silently mask a broken node.
     pub stt_upstream_attempts: Family<Vec<(String, String)>, Counter>,
+    /// State-aware routing decisions, labeled by `decision` (`primary_ready` |
+    /// `failover_warm` | `primary_cold` | `primary_down` | `all_unreachable`).
+    /// A non-zero `failover_warm`/`primary_down` rate is the signal that
+    /// state-aware routing is actively reordering; a `primary_ready`-dominated
+    /// steady state confirms the CUDA failover takes no steady-state load
+    /// (plan 2026-06-02-004, R7). Fixed cardinality (5 series).
+    pub stt_routing_decisions: Family<Vec<(String, String)>, Counter>,
 }
 
 impl Metrics {
@@ -70,13 +77,28 @@ impl Metrics {
             stt_upstream_attempts.clone(),
         );
 
+        let stt_routing_decisions = Family::default();
+        registry.register(
+            "speech_router_stt_routing_decisions_total",
+            "State-aware STT routing decisions by chosen-order decision",
+            stt_routing_decisions.clone(),
+        );
+
         Metrics {
             requests_total,
             request_duration,
             wyoming_connections,
             stt_empty_transcript_fallback,
             stt_upstream_attempts,
+            stt_routing_decisions,
         }
+    }
+
+    /// Record one state-aware routing decision (Unit 4 / R7).
+    pub fn record_routing_decision(&self, decision: crate::node_state::RoutingDecision) {
+        self.stt_routing_decisions
+            .get_or_create(&routing_decision_labels(decision.as_str()))
+            .inc();
     }
 }
 
@@ -86,6 +108,11 @@ pub fn stt_upstream_labels(upstream: &str, outcome: &str) -> Vec<(String, String
         ("upstream".to_owned(), upstream.to_owned()),
         ("outcome".to_owned(), outcome.to_owned()),
     ]
+}
+
+/// Build the label set for `stt_routing_decisions`.
+pub fn routing_decision_labels(decision: &str) -> Vec<(String, String)> {
+    vec![("decision".to_owned(), decision.to_owned())]
 }
 
 /// Build the label set for `requests_total`.
@@ -125,6 +152,28 @@ mod tests {
                 ("status".to_owned(), "ok".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn routing_decision_labels_produces_correct_vec() {
+        assert_eq!(
+            routing_decision_labels("failover_warm"),
+            vec![("decision".to_owned(), "failover_warm".to_owned())]
+        );
+    }
+
+    #[test]
+    fn routing_decision_metric_encodes_each_series() {
+        let mut registry = Registry::default();
+        let metrics = Metrics::new(&mut registry);
+        metrics.record_routing_decision(crate::node_state::RoutingDecision::FailoverWarm);
+        metrics.record_routing_decision(crate::node_state::RoutingDecision::PrimaryDown);
+        metrics.record_routing_decision(crate::node_state::RoutingDecision::PrimaryDown);
+
+        let output = encode_registry(&registry).expect("encode should succeed");
+        assert!(output.contains("speech_router_stt_routing_decisions_total"));
+        assert!(output.contains("decision=\"failover_warm\""));
+        assert!(output.contains("decision=\"primary_down\""));
     }
 
     #[test]
