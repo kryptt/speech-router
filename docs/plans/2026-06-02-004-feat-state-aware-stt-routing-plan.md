@@ -326,7 +326,12 @@ existing plan-003/0.5.1 failover + detection-failover tests still pass unchanged
 
 **Verification:** metrics test passes; the decision counter is visible on `/metrics`.
 
-- [ ] **Unit 5: Config knob, deploy, and live validation**
+- [x] **Unit 5: Config knob, deploy, and live validation**
+  <!-- Code shipped: STATE_POLL_INTERVAL_SECS (default 5, 0 disables) + tests,
+       version → 0.6.0. Fleet image bump + controlled-restart drill + the
+       interval=0 fallback check are operational, post-merge steps on the
+       cluster (separate hr-fleet repo). -->
+
 
 **Goal:** Ship behind a knob and validate on the cluster.
 

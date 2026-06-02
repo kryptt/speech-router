@@ -242,8 +242,58 @@ mod tests {
                 assert_eq!(config.internal_addr.port(), 9090);
                 assert_eq!(config.default_tts_model, "kokoro");
                 assert_eq!(config.default_tts_voice, "af_heart");
+                // state-aware-routing poll interval defaults to 5s
+                assert_eq!(config.state_poll_interval_secs, 5);
             },
         );
+    }
+
+    #[test]
+    fn state_poll_interval_default_override_and_disable() {
+        with_env(&[("STT_URLS", "x")], || {
+            clear_all();
+            unsafe {
+                env::set_var("STT_URLS", "http://llama-swap:8080");
+                env::set_var("TTS_URL", "http://kokoro:8080");
+            }
+            // default when unset
+            assert_eq!(
+                Config::from_env().expect("parse").state_poll_interval_secs,
+                5
+            );
+            // explicit override
+            unsafe { env::set_var("STATE_POLL_INTERVAL_SECS", "10") };
+            assert_eq!(
+                Config::from_env().expect("parse").state_poll_interval_secs,
+                10
+            );
+            // 0 disables the poller (static ordering)
+            unsafe { env::set_var("STATE_POLL_INTERVAL_SECS", "0") };
+            assert_eq!(
+                Config::from_env().expect("parse").state_poll_interval_secs,
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn state_poll_interval_invalid_is_error() {
+        with_env(&[("STT_URLS", "x")], || {
+            clear_all();
+            unsafe {
+                env::set_var("STT_URLS", "http://llama-swap:8080");
+                env::set_var("TTS_URL", "http://kokoro:8080");
+                env::set_var("STATE_POLL_INTERVAL_SECS", "not_a_number");
+            }
+            let err = Config::from_env().unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::InvalidValue {
+                    key: "STATE_POLL_INTERVAL_SECS",
+                    ..
+                }
+            ));
+        });
     }
 
     #[test]
