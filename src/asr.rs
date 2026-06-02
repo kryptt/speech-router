@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Multipart, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 
 use futures_util::TryStreamExt;
 
@@ -63,12 +66,13 @@ enum AsrTask {
 }
 
 impl AsrTask {
-    /// Speaches endpoint path for this task.
-    fn endpoint(self) -> &'static str {
-        match self {
-            AsrTask::Transcribe => "/v1/audio/transcriptions",
-            AsrTask::Translate => "/v1/audio/translations",
-        }
+    /// Whether this task asks whisper-server to translate to English.
+    ///
+    /// whisper.cpp exposes translate as a `translate=true` form field on the
+    /// single transcription endpoint — there is no `/v1/audio/translations`
+    /// route. Translation always targets English.
+    fn is_translate(self) -> bool {
+        matches!(self, AsrTask::Translate)
     }
 }
 
@@ -95,6 +99,117 @@ fn language_name(code: &str) -> &'static str {
     isolang::Language::from_639_1(code)
         .map(|lang| lang.to_name())
         .unwrap_or("Unknown")
+}
+
+/// Build the whisper-server transcription URL on a llama-swap upstream:
+/// `{base}/upstream/{model}/v1/audio/transcriptions`. The `/upstream/<model>`
+/// prefix selects the model by URL (version-proof) and forwards the rest of the
+/// path to the child server verbatim.
+fn transcription_url(stt_base: &str, model: &str) -> String {
+    format!("{stt_base}/upstream/{model}/v1/audio/transcriptions")
+}
+
+/// Normalize a language value returned by whisper.cpp (`verbose_json`) into an
+/// ISO 639-1 two-letter code.
+///
+/// whisper.cpp emits the English language NAME (commonly lowercase, e.g.
+/// "english"), whereas Speaches emitted the code directly. The rest of the
+/// `/asr` pipeline (`decide_task`, `find_track_by_language`, `language_name`)
+/// requires the 2-letter code, so this bridges the gap: accept an existing
+/// code, then an explicit map of whisper's known outputs, then a
+/// case-insensitive `isolang` name lookup. Returns `None` for truly unknown
+/// values (the caller treats that as a failed detection rather than guessing).
+///
+/// NOTE: the exact casing/spelling whisper-server emits is confirmed against a
+/// live backend in Unit 6 (RTF/parity gate). This lookup is deliberately
+/// tolerant so a casing surprise degrades to a clean failure, never a silent
+/// mis-route.
+fn normalize_language_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+
+    // Already an ISO 639-1 code?
+    if lower.len() == 2 {
+        if let Some(lang) = isolang::Language::from_639_1(&lower) {
+            return lang.to_639_1().map(str::to_string);
+        }
+    }
+
+    // Explicit map for whisper.cpp's language names where they may differ from
+    // isolang's canonical English name.
+    if let Some(code) = whisper_name_to_639_1(&lower) {
+        return Some(code.to_string());
+    }
+
+    // Fall back to isolang's English-name lookup (canonical names are
+    // title-cased, e.g. "English").
+    if let Some(code) =
+        isolang::Language::from_name(&title_case_words(&lower)).and_then(|lang| lang.to_639_1())
+    {
+        return Some(code.to_string());
+    }
+    isolang::Language::from_name(trimmed)
+        .and_then(|lang| lang.to_639_1())
+        .map(str::to_string)
+}
+
+/// Title-case each whitespace-separated word ("modern greek" -> "Modern Greek").
+fn title_case_words(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Map whisper.cpp language names (lowercase) to ISO 639-1 codes for common
+/// languages, covering cases where isolang's canonical name differs from
+/// whisper's output. Returns `None` for unmapped names (the caller falls back
+/// to an isolang name lookup).
+fn whisper_name_to_639_1(name: &str) -> Option<&'static str> {
+    let code = match name {
+        "english" => "en",
+        "chinese" | "mandarin" => "zh",
+        "german" => "de",
+        "spanish" | "castilian" => "es",
+        "russian" => "ru",
+        "korean" => "ko",
+        "french" => "fr",
+        "japanese" => "ja",
+        "portuguese" => "pt",
+        "turkish" => "tr",
+        "polish" => "pl",
+        "catalan" => "ca",
+        "dutch" | "flemish" => "nl",
+        "arabic" => "ar",
+        "swedish" => "sv",
+        "italian" => "it",
+        "indonesian" => "id",
+        "hindi" => "hi",
+        "finnish" => "fi",
+        "vietnamese" => "vi",
+        "hebrew" => "he",
+        "ukrainian" => "uk",
+        "greek" => "el",
+        "malay" => "ms",
+        "czech" => "cs",
+        "romanian" | "moldavian" | "moldovan" => "ro",
+        "danish" => "da",
+        "hungarian" => "hu",
+        "norwegian" => "no",
+        "thai" => "th",
+        "urdu" => "ur",
+        _ => return None,
+    };
+    Some(code)
 }
 
 // ---------------------------------------------------------------------------
@@ -166,8 +281,10 @@ fn find_track_by_language<'a>(tracks: &'a [AudioTrack], lang: &str) -> Option<&'
 /// The handler state — must be extractable from the app router.
 #[derive(Clone)]
 pub struct AsrState {
-    pub speaches_url: String,
-    pub default_model: String,
+    /// Ordered llama-swap STT upstreams; v1 uses the first entry.
+    pub stt_upstreams: Vec<String>,
+    /// llama-swap model id used in the `/upstream/{model}` path.
+    pub stt_model: String,
     pub client: std::sync::Arc<reqwest::Client>,
 }
 
@@ -211,14 +328,25 @@ pub async fn handle_asr(
         .filter(|l| !l.is_empty())
         .unwrap_or("en");
 
+    // v1 uses the first STT upstream. (Ordered-list failover is a fast-follow.)
+    let stt_base = match state.stt_upstreams.first() {
+        Some(b) => b.as_str(),
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no STT upstream configured",
+            );
+        }
+    };
+
     match select_and_transcribe(
         &audio.temp_path,
         &audio.file_name,
         requested_lang,
         params.output,
         response_format,
-        &state.default_model,
-        &state.speaches_url,
+        &state.stt_model,
+        stt_base,
         &state.client,
     )
     .await
@@ -244,7 +372,7 @@ async fn select_and_transcribe(
     output: AsrOutput,
     response_format: &str,
     model: &str,
-    speaches_url: &str,
+    stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
     if ffmpeg::is_video_file(file_name) {
@@ -254,7 +382,7 @@ async fn select_and_transcribe(
             output,
             response_format,
             model,
-            speaches_url,
+            stt_base,
             client,
         )
         .await
@@ -265,7 +393,7 @@ async fn select_and_transcribe(
             output,
             response_format,
             model,
-            speaches_url,
+            stt_base,
             client,
         )
         .await
@@ -280,7 +408,7 @@ async fn select_and_transcribe_video(
     output: AsrOutput,
     response_format: &str,
     model: &str,
-    speaches_url: &str,
+    stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
     let video_path_owned = video_path.to_path_buf();
@@ -329,7 +457,7 @@ async fn select_and_transcribe_video(
     for track_index in attempts {
         let audio = extract_video_audio_track(video_path, track_index).await?;
 
-        let detected = detect_language_from_file(speaches_url, model, client, &audio.temp_path)
+        let detected = detect_language_from_file(stt_base, model, client, &audio.temp_path)
             .await
             .map_err(|e| {
                 tracing::warn!(error = %e, "language detection failed");
@@ -355,7 +483,7 @@ async fn select_and_transcribe_video(
                     output,
                     response_format,
                     model,
-                    speaches_url,
+                    stt_base,
                     client,
                 )
                 .await;
@@ -370,7 +498,7 @@ async fn select_and_transcribe_video(
                     output,
                     response_format,
                     model,
-                    speaches_url,
+                    stt_base,
                     client,
                 )
                 .await;
@@ -402,10 +530,10 @@ async fn select_and_transcribe_audio(
     output: AsrOutput,
     response_format: &str,
     model: &str,
-    speaches_url: &str,
+    stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
-    let detected = detect_language_from_file(speaches_url, model, client, audio_path)
+    let detected = detect_language_from_file(stt_base, model, client, audio_path)
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "language detection failed");
@@ -430,7 +558,7 @@ async fn select_and_transcribe_audio(
                 output,
                 response_format,
                 model,
-                speaches_url,
+                stt_base,
                 client,
             )
             .await
@@ -443,7 +571,7 @@ async fn select_and_transcribe_audio(
                 output,
                 response_format,
                 model,
-                speaches_url,
+                stt_base,
                 client,
             )
             .await
@@ -468,11 +596,11 @@ async fn send_to_speaches(
     output: AsrOutput,
     response_format: &str,
     model: &str,
-    speaches_url: &str,
+    stt_base: &str,
     client: &reqwest::Client,
 ) -> Result<Response, Response> {
     let file = tokio::fs::File::open(audio_path).await.map_err(|e| {
-        tracing::warn!(error = %e, "failed to open audio file for speaches");
+        tracing::warn!(error = %e, "failed to open audio file for stt backend");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
     })?;
 
@@ -485,14 +613,19 @@ async fn send_to_speaches(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         })?;
 
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("model", model.to_string())
         .text("response_format", response_format.to_string())
         .text("temperature", "0.0")
         .text("language", language.to_string());
+    if task.is_translate() {
+        // whisper.cpp translates to English via this form field; there is no
+        // separate /v1/audio/translations route.
+        form = form.text("translate", "true");
+    }
 
-    let url = format!("{}{}", speaches_url, task.endpoint());
+    let url = transcription_url(stt_base, model);
 
     let upstream = client
         .post(&url)
@@ -500,7 +633,7 @@ async fn send_to_speaches(
         .send()
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "speaches request failed");
+            tracing::warn!(error = %e, "stt backend request failed");
             error_response(StatusCode::BAD_GATEWAY, "upstream unavailable")
         })?;
 
@@ -508,7 +641,7 @@ async fn send_to_speaches(
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     let body = upstream.bytes().await.map_err(|e| {
-        tracing::warn!(error = %e, "failed to read speaches response body");
+        tracing::warn!(error = %e, "failed to read stt backend response body");
         error_response(StatusCode::BAD_GATEWAY, "failed to read upstream response")
     })?;
 
@@ -552,9 +685,19 @@ pub async fn handle_detect_language(
         audio
     };
 
+    let stt_base = match state.stt_upstreams.first() {
+        Some(b) => b.as_str(),
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no STT upstream configured",
+            );
+        }
+    };
+
     let code = match detect_language_from_file(
-        &state.speaches_url,
-        &state.default_model,
+        stt_base,
+        &state.stt_model,
         &state.client,
         &audio.temp_path,
     )
@@ -633,12 +776,25 @@ async fn extract_video_audio_track(
 const DETECT_NUM_SAMPLES: usize = 13;
 const DETECT_SAMPLE_DURATION: f64 = 30.0;
 
+/// Max concurrent language-detection requests in flight against a single
+/// whisper-server (which serialises inference behind one mutex). Bounding this
+/// avoids queueing all chunks at once and tripping per-request timeouts.
+const DETECT_CONCURRENCY: usize = 4;
+
+/// Per-request timeout for one detection chunk — generous enough to absorb a
+/// llama-swap cold model load (~5-11s) plus a 30s-chunk transcription.
+const DETECT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Minimum number of chunk detections that must succeed before trusting the
+/// majority vote; below this we fail loudly rather than guess a language.
+const DETECT_MIN_QUORUM: usize = 2;
+
 /// Detect the language of an audio file using multi-chunk majority voting.
 ///
 /// This is the reusable entry point called by both the `/asr` pipeline and
 /// the `/detect-language` endpoint.
 async fn detect_language_from_file(
-    speaches_url: &str,
+    stt_base: &str,
     model: &str,
     client: &reqwest::Client,
     audio_path: &Path,
@@ -653,20 +809,29 @@ async fn detect_language_from_file(
 
     if offsets.len() == 1 && offsets[0] == 0.0 && duration <= DETECT_SAMPLE_DURATION {
         // Short file: send it directly without segmenting.
-        return detect_language_single(speaches_url, model, client, audio_path).await;
+        return detect_language_single(stt_base, model, client, audio_path).await;
     }
 
-    // Extract segments and detect concurrently.
+    // Extract segments and detect concurrently, but bound concurrency: a single
+    // whisper-server serialises inference behind one mutex, so firing all N
+    // chunks at once just queues them and risks per-request timeouts.
+    let sem = Arc::new(Semaphore::new(DETECT_CONCURRENCY));
     let mut handles = Vec::with_capacity(offsets.len());
 
     for offset in &offsets {
-        let speaches_url = speaches_url.to_string();
+        let stt_base = stt_base.to_string();
         let model = model.to_string();
         let client = client.clone();
         let offset = *offset;
         let audio_path = audio_path.to_path_buf();
+        let sem = sem.clone();
 
         handles.push(tokio::spawn(async move {
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .map_err(|e| format!("detection semaphore closed: {e}"))?;
+
             let named = tempfile::Builder::new()
                 .suffix(".wav")
                 .tempfile()
@@ -682,15 +847,17 @@ async fn detect_language_from_file(
             .map_err(|e| format!("extract_segment task panicked: {e}"))?
             .map_err(|e| format!("segment extraction at {offset:.1}s failed: {e}"))?;
 
-            detect_language_single(&speaches_url, &model, &client, &segment_path).await
+            detect_language_single(&stt_base, &model, &client, &segment_path).await
         }));
     }
 
     let mut votes: HashMap<String, usize> = HashMap::new();
+    let mut successes = 0usize;
 
     for handle in handles {
         match handle.await {
             Ok(Ok(lang)) => {
+                successes += 1;
                 *votes.entry(lang).or_insert(0) += 1;
             }
             Ok(Err(e)) => {
@@ -702,6 +869,17 @@ async fn detect_language_from_file(
         }
     }
 
+    // Require a quorum of successful chunks before trusting the vote, so a
+    // busy/slow whisper-server (most chunks dropped) can't silently default to
+    // a wrong language.
+    let quorum = DETECT_MIN_QUORUM.min(offsets.len());
+    if successes < quorum {
+        return Err(format!(
+            "language detection below quorum: {successes}/{} chunks succeeded (need {quorum})",
+            offsets.len()
+        ));
+    }
+
     votes
         .into_iter()
         .max_by_key(|(_lang, count)| *count)
@@ -711,7 +889,7 @@ async fn detect_language_from_file(
 
 /// Detect the language of a single audio file by sending it to Speaches.
 async fn detect_language_single(
-    speaches_url: &str,
+    stt_base: &str,
     model: &str,
     client: &reqwest::Client,
     audio_path: &Path,
@@ -730,19 +908,22 @@ async fn detect_language_single(
         .part("file", part)
         .text("model", model.to_string())
         .text("response_format", "verbose_json")
-        .text("temperature", "0.0");
+        .text("temperature", "0.0")
+        // whisper-server defaults --language to "en"; force auto-detect.
+        .text("language", "auto");
 
-    let url = format!("{speaches_url}/v1/audio/transcriptions");
+    let url = transcription_url(stt_base, model);
 
     let upstream = client
         .post(&url)
+        .timeout(DETECT_REQUEST_TIMEOUT)
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("speaches request failed: {e}"))?;
+        .map_err(|e| format!("stt request failed: {e}"))?;
 
     if !upstream.status().is_success() {
-        return Err(format!("speaches returned {}", upstream.status()));
+        return Err(format!("stt backend returned {}", upstream.status()));
     }
 
     let body: serde_json::Value = upstream
@@ -750,10 +931,14 @@ async fn detect_language_single(
         .await
         .map_err(|e| format!("failed to parse verbose_json: {e}"))?;
 
-    body.get("language")
+    let raw = body
+        .get("language")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "no language field in response".to_string())
+        .ok_or_else(|| "no language field in response".to_string())?;
+
+    // whisper.cpp verbose_json returns the language NAME (commonly lowercase,
+    // e.g. "english"), not the ISO 639-1 code the rest of the pipeline needs.
+    normalize_language_code(raw).ok_or_else(|| format!("unrecognized detected language '{raw}'"))
 }
 
 // ---------------------------------------------------------------------------
@@ -913,9 +1098,9 @@ mod tests {
     }
 
     #[test]
-    fn task_endpoints() {
-        assert_eq!(AsrTask::Transcribe.endpoint(), "/v1/audio/transcriptions");
-        assert_eq!(AsrTask::Translate.endpoint(), "/v1/audio/translations");
+    fn task_is_translate() {
+        assert!(!AsrTask::Transcribe.is_translate());
+        assert!(AsrTask::Translate.is_translate());
     }
 
     #[test]
@@ -1028,5 +1213,48 @@ mod tests {
             find_track_by_language(&tracks, "en").map(|t| t.index),
             Some(1)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // transcription_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transcription_url_builds_upstream_path() {
+        assert_eq!(
+            transcription_url("http://llama-swap:8080", "whisper"),
+            "http://llama-swap:8080/upstream/whisper/v1/audio/transcriptions"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_language_code  (P0: whisper.cpp returns a NAME, not an ISO code)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_language_name_lowercase_via_map() {
+        assert_eq!(normalize_language_code("english").as_deref(), Some("en"));
+        assert_eq!(normalize_language_code("german").as_deref(), Some("de"));
+        assert_eq!(normalize_language_code("japanese").as_deref(), Some("ja"));
+        assert_eq!(normalize_language_code("dutch").as_deref(), Some("nl"));
+    }
+
+    #[test]
+    fn normalize_language_titlecased_input() {
+        assert_eq!(normalize_language_code("English").as_deref(), Some("en"));
+        assert_eq!(normalize_language_code("  German  ").as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn normalize_language_existing_code_passthrough() {
+        assert_eq!(normalize_language_code("en").as_deref(), Some("en"));
+        assert_eq!(normalize_language_code("DE").as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn normalize_language_unknown_returns_none() {
+        assert_eq!(normalize_language_code("klingon"), None);
+        assert_eq!(normalize_language_code(""), None);
+        assert_eq!(normalize_language_code("   "), None);
     }
 }

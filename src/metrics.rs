@@ -16,6 +16,10 @@ pub struct Metrics {
     pub requests_total: Family<Vec<(String, String)>, Counter>,
     pub request_duration: Family<Vec<(String, String)>, Histogram>,
     pub wyoming_connections: Gauge,
+    /// Incremented whenever a Wyoming STT request fails and an empty transcript
+    /// is returned as a fallback. A non-zero rate signals a (silent-to-the-user)
+    /// STT backend outage and is the trigger for investigating/rolling back.
+    pub stt_empty_transcript_fallback: Counter,
 }
 
 impl Metrics {
@@ -46,10 +50,18 @@ impl Metrics {
             wyoming_connections.clone(),
         );
 
+        let stt_empty_transcript_fallback: Counter = Counter::default();
+        registry.register(
+            "speech_router_stt_empty_transcript_fallback_total",
+            "Wyoming STT requests that failed and returned an empty transcript fallback",
+            stt_empty_transcript_fallback.clone(),
+        );
+
         Metrics {
             requests_total,
             request_duration,
             wyoming_connections,
+            stt_empty_transcript_fallback,
         }
     }
 }

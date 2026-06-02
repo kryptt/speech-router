@@ -7,6 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::metrics::Metrics;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -247,8 +248,8 @@ fn info_event(config: &Config) -> Event {
                 "url": "https://speaches.ai"
             },
             "models": [{
-                "name": config.default_model,
-                "description": format!("Faster Whisper {}", config.default_model),
+                "name": config.stt_model,
+                "description": format!("whisper.cpp {}", config.stt_model),
                 "installed": true,
                 "languages": ["en", "es", "fr", "de", "nl"],
                 "attribution": {
@@ -315,31 +316,39 @@ async fn finish_stt(
         .mime_str("audio/wav")
         .map_err(|e| format!("mime error: {e}"))?;
 
+    let stt_base = config
+        .stt_upstreams
+        .first()
+        .ok_or_else(|| "no STT upstream configured".to_string())?;
+
     let form = reqwest::multipart::Form::new()
         .part("file", part)
-        .text("model", config.default_model.clone())
+        .text("model", config.stt_model.clone())
         .text("language", session.language.clone())
         .text("response_format", "json");
 
-    let url = format!("{}/v1/audio/transcriptions", config.speaches_url);
+    let url = format!(
+        "{stt_base}/upstream/{}/v1/audio/transcriptions",
+        config.stt_model
+    );
 
     let resp = client
         .post(&url)
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("speaches request failed: {e}"))?;
+        .map_err(|e| format!("stt backend request failed: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("speaches returned {status}: {body}"));
+        return Err(format!("stt backend returned {status}: {body}"));
     }
 
     let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("invalid JSON from speaches: {e}"))?;
+        .map_err(|e| format!("invalid JSON from stt backend: {e}"))?;
 
     let text = body
         .get("text")
@@ -367,7 +376,7 @@ async fn handle_tts<W: AsyncWriteExt + Unpin>(
     config: &Config,
     client: &reqwest::Client,
 ) -> Result<(), String> {
-    let url = format!("{}/v1/audio/speech", config.speaches_url);
+    let url = format!("{}/v1/audio/speech", config.tts_url);
 
     let body = serde_json::json!({
         "model": config.default_tts_model,
@@ -379,15 +388,16 @@ async fn handle_tts<W: AsyncWriteExt + Unpin>(
 
     let resp = client
         .post(&url)
+        .timeout(std::time::Duration::from_secs(30))
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("speaches TTS request failed: {e}"))?;
+        .map_err(|e| format!("tts backend request failed: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body_text = resp.text().await.unwrap_or_default();
-        return Err(format!("speaches TTS returned {status}: {body_text}"));
+        return Err(format!("tts backend returned {status}: {body_text}"));
     }
 
     let audio_fmt = serde_json::json!({
@@ -430,7 +440,12 @@ async fn handle_tts<W: AsyncWriteExt + Unpin>(
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(stream: TcpStream, config: Arc<Config>, client: Arc<reqwest::Client>) {
+async fn handle_connection(
+    stream: TcpStream,
+    config: Arc<Config>,
+    client: Arc<reqwest::Client>,
+    metrics: Arc<Metrics>,
+) {
     let addr = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -519,6 +534,9 @@ async fn handle_connection(stream: TcpStream, config: Arc<Config>, client: Arc<r
                         }
                         Err(e) => {
                             warn!(%addr, error = %e, "STT transcription failed");
+                            // Surface the (otherwise silent) outage as a metric;
+                            // a non-zero rate is the rollback trigger.
+                            metrics.stt_empty_transcript_fallback.inc();
                             // Send empty transcript on error so the client is not stuck.
                             let fallback_data = serde_json::json!({"text": ""});
                             let fallback = make_event("transcript", Some(&fallback_data), &[]);
@@ -572,7 +590,12 @@ async fn handle_connection(stream: TcpStream, config: Arc<Config>, client: Arc<r
 /// Run the Wyoming protocol TCP server.
 ///
 /// This function never returns under normal operation.
-pub async fn serve(listener: TcpListener, config: Arc<Config>, client: Arc<reqwest::Client>) {
+pub async fn serve(
+    listener: TcpListener,
+    config: Arc<Config>,
+    client: Arc<reqwest::Client>,
+    metrics: Arc<Metrics>,
+) {
     let addr = listener
         .local_addr()
         .map(|a| a.to_string())
@@ -584,7 +607,8 @@ pub async fn serve(listener: TcpListener, config: Arc<Config>, client: Arc<reqwe
             Ok((stream, _)) => {
                 let config = Arc::clone(&config);
                 let client = Arc::clone(&client);
-                tokio::spawn(handle_connection(stream, config, client));
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(handle_connection(stream, config, client, metrics));
             }
             Err(e) => {
                 warn!(error = %e, "wyoming accept error");
@@ -812,11 +836,13 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
-            speaches_url: "http://localhost:8080".to_string(),
+            stt_upstreams: vec!["http://localhost:8080".to_string()],
+            tts_url: "http://localhost:8080".to_string(),
+            stt_model: "whisper".to_string(),
+            speaches_url: None,
             public_addr: "0.0.0.0:8000".parse().unwrap(),
             wyoming_port: 10300,
             internal_addr: "0.0.0.0:9090".parse().unwrap(),
-            default_model: "large-v3-turbo".to_string(),
             default_tts_model: "kokoro".to_string(),
             default_tts_voice: "af_heart".to_string(),
         }

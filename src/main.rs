@@ -47,11 +47,13 @@ async fn main() {
     let config = Config::from_env().expect("invalid configuration");
 
     info!(
-        speaches_url = %config.speaches_url,
+        stt_upstreams = ?config.stt_upstreams,
+        tts_url = %config.tts_url,
+        stt_model = %config.stt_model,
+        speaches_url = ?config.speaches_url,
         public_addr = %config.public_addr,
         wyoming_port = config.wyoming_port,
         internal_addr = %config.internal_addr,
-        default_model = %config.default_model,
         "starting speech-router"
     );
 
@@ -59,6 +61,10 @@ async fn main() {
     let client = Arc::new(
         reqwest::Client::builder()
             .pool_max_idle_per_host(4)
+            // Bound connection establishment so a dead/unreachable backend fails
+            // fast. We deliberately do NOT set a total request timeout here:
+            // full-file transcription (Bazarr) can legitimately run for minutes.
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client"),
     );
@@ -81,11 +87,12 @@ async fn main() {
         wyoming_listener,
         state.config.clone(),
         state.client.clone(),
+        state.metrics.clone(),
     ));
 
     let asr_state = AsrState {
-        speaches_url: state.config.speaches_url.clone(),
-        default_model: state.config.default_model.clone(),
+        stt_upstreams: state.config.stt_upstreams.clone(),
+        stt_model: state.config.stt_model.clone(),
         client: state.client.clone(),
     };
 
@@ -160,10 +167,64 @@ async fn passthrough_route(
     let labels = metrics::request_labels("openai", "passthrough", "ok");
     state.metrics.requests_total.get_or_create(&labels).inc();
 
+    let path = uri.path();
+
+    // Synthesize /v1/models locally so OpenAI-compatible audio clients can
+    // validate the connection without a Speaches backend.
+    if path == "/v1/models" {
+        return models_response(&state.config);
+    }
+
+    // whisper-server (reached via /upstream) only translates via a
+    // `translate=true` multipart form field, which this byte-level passthrough
+    // cannot inject without buffering and re-encoding the form. Rather than
+    // silently return a transcription for a translation request, reject it
+    // clearly. Audio translation is available via the /asr endpoint (translate
+    // task), which sets the field correctly. (Full OpenAI-passthrough
+    // translation support is a deferred enhancement.)
+    if path == "/v1/audio/translations" {
+        return proxy::error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "translation via /v1/audio/translations is not supported by this backend; \
+             use the /asr endpoint (translate task) for audio translation",
+        );
+    }
+
+    // Select the upstream by path: STT audio is rewritten onto the llama-swap
+    // /upstream/<model> path; TTS goes to Kokoro; anything else falls back to
+    // the legacy Speaches URL during the phase-out window.
+    let (backend_url, fwd_path): (String, String) = match path {
+        "/v1/audio/transcriptions" => match state.config.stt_upstreams.first() {
+            Some(base) => (
+                base.clone(),
+                format!(
+                    "/upstream/{}/v1/audio/transcriptions",
+                    state.config.stt_model
+                ),
+            ),
+            None => {
+                return proxy::error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "no STT upstream configured",
+                );
+            }
+        },
+        "/v1/audio/speech" => (state.config.tts_url.clone(), path.to_string()),
+        _ => match &state.config.speaches_url {
+            Some(u) => (u.clone(), path.to_string()),
+            None => {
+                return proxy::error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "no upstream configured for this path",
+                );
+            }
+        },
+    };
+
     proxy::forward(proxy::ProxyRequest {
         client: &state.client,
-        backend_url: &state.config.speaches_url,
-        path: uri.path(),
+        backend_url: &backend_url,
+        path: &fwd_path,
         query: uri.query(),
         method,
         headers: &headers,
@@ -172,14 +233,44 @@ async fn passthrough_route(
     .await
 }
 
+/// Synthesize a minimal OpenAI `/v1/models` listing for the audio models so
+/// OpenAI-compatible clients (e.g. Open WebUI) can validate the connection
+/// without a Speaches backend.
+fn models_response(config: &Config) -> Response {
+    let models = json!({
+        "object": "list",
+        "data": [
+            { "id": config.stt_model, "object": "model", "owned_by": "speech-router" },
+            { "id": config.default_tts_model, "object": "model", "owned_by": "speech-router" },
+        ]
+    });
+    (StatusCode::OK, axum::Json(models)).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Internal handlers
 // ---------------------------------------------------------------------------
 
 async fn health_route(State(state): State<AppState>) -> Response {
-    let check_url = format!("{}/v1/models", state.config.speaches_url);
+    // Probe the STT backend's llama-swap model list (which does NOT trigger a
+    // model load) so readiness reflects STT availability without depending on
+    // Speaches. TTS (Kokoro) is intentionally not gated here.
+    let Some(base) = state.config.stt_upstreams.first() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"status": "unhealthy", "reason": "no STT upstream configured"})),
+        )
+            .into_response();
+    };
+    let check_url = format!("{base}/v1/models");
 
-    match state.client.get(&check_url).send().await {
+    match state
+        .client
+        .get(&check_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(resp) if resp.status().is_success() => {
             (StatusCode::OK, axum::Json(json!({"status": "ok"}))).into_response()
         }
@@ -189,7 +280,7 @@ async fn health_route(State(state): State<AppState>) -> Response {
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(json!({
                     "status": "unhealthy",
-                    "reason": format!("speaches returned {status}")
+                    "reason": format!("stt backend returned {status}")
                 })),
             )
                 .into_response()
@@ -198,7 +289,7 @@ async fn health_route(State(state): State<AppState>) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(json!({
                 "status": "unhealthy",
-                "reason": format!("speaches unreachable: {e}")
+                "reason": format!("stt backend unreachable: {e}")
             })),
         )
             .into_response(),
