@@ -18,6 +18,8 @@ pub(crate) enum FfmpegError {
     NoAudioStream,
     #[error("audio stream index {0} not found")]
     StreamNotFound(u32),
+    #[error("pcm_s16le encoder not available in this ffmpeg build")]
+    EncoderNotFound,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +113,20 @@ pub(crate) fn extract_segment(
 /// Target parameters for all audio extraction: 16 kHz mono signed 16-bit.
 const TARGET_RATE: u32 = 16_000;
 
+/// Allocate an output frame in the resampler's target format (16 kHz mono
+/// s16le) with room for `capacity_samples`.
+///
+/// Pre-allocating with explicit parameters is required: handed a bare
+/// `AudioFrame::empty()`, `swr_convert_frame` raises `AVERROR_OUTPUT_CHANGED`
+/// because the frame it auto-allocates doesn't satisfy its output-param check.
+fn mono_s16_frame(capacity_samples: usize) -> AudioFrame {
+    AudioFrame::new(
+        ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed),
+        capacity_samples.max(1),
+        ffmpeg_next::ChannelLayout::MONO,
+    )
+}
+
 fn transcode_audio(
     input_path: &Path,
     output_path: &Path,
@@ -163,10 +179,26 @@ fn transcode_audio(
         _ => None,
     };
 
+    // Resolve a concrete input channel layout. Raw PCM (and some other inputs)
+    // report an UNSPEC layout in libav 7 — `channel_layout()` comes back empty
+    // (bits = 0) even though the channel count is known. `swr_convert_frame`
+    // refuses an unspecified layout and returns AVERROR_INPUT_CHANGED, which
+    // failed every extraction. Fall back to the canonical default layout for
+    // the channel count, and stamp the same layout onto each decoded frame
+    // below so the frame matches the resampler's configured input.
+    let in_layout = {
+        let cl = decoder.channel_layout();
+        if cl.is_empty() {
+            ffmpeg_next::ChannelLayout::default(i32::from(decoder.channels()))
+        } else {
+            cl
+        }
+    };
+
     // Set up resampler: input format -> 16 kHz mono s16.
     let mut resampler = resampling::Context::get(
         decoder.format(),
-        decoder.channel_layout(),
+        in_layout,
         decoder.rate(),
         ffmpeg_next::format::Sample::I16(ffmpeg_next::format::sample::Type::Packed),
         ffmpeg_next::ChannelLayout::MONO,
@@ -174,38 +206,41 @@ fn transcode_audio(
     )?;
 
     // Set up output: WAV container with pcm_s16le.
+    //
+    // The encoder context MUST be created bound to the codec
+    // (`new_with_codec`) and opened with it (`open_as`). A codec-less
+    // `Context::new()` makes `avcodec_open2()` fail with "No codec provided to
+    // avcodec_open2()" — which silently broke EVERY segment extraction and thus
+    // all multi-chunk language detection (`/asr` returned "language detection
+    // failed" / 0-of-N chunks). See the `extract_segment_produces_valid_wav`
+    // regression test.
     let mut output_ctx = format::output(output_path)?;
-    {
-        let mut out_stream = output_ctx.add_stream(codec::encoder::find(codec::Id::PCM_S16LE))?;
-        let encoder_ctx = codec::context::Context::new();
-        // Configure encoder parameters for PCM s16le.
-        let mut enc = encoder_ctx.encoder().audio()?;
-        enc.set_rate(TARGET_RATE as i32);
-        enc.set_channel_layout(ffmpeg_next::ChannelLayout::MONO);
-        enc.set_format(ffmpeg_next::format::Sample::I16(
-            ffmpeg_next::format::sample::Type::Packed,
-        ));
-        enc.set_time_base(ffmpeg_next::Rational::new(1, TARGET_RATE as i32));
-        let encoder = enc.open()?;
-        out_stream.set_parameters(&encoder);
-    }
-    output_ctx.write_header()?;
 
-    let out_stream_index = 0usize;
-    let out_time_base = output_ctx.stream(out_stream_index).unwrap().time_base();
+    let pcm_codec =
+        codec::encoder::find(codec::Id::PCM_S16LE).ok_or(FfmpegError::EncoderNotFound)?;
 
-    // Build the encoder from the output stream parameters so we can feed it
-    // resampled frames.
-    let out_params = output_ctx.stream(out_stream_index).unwrap().parameters();
-    let enc_ctx = codec::context::Context::from_parameters(out_params)?;
-    let mut encoder = enc_ctx.encoder().audio()?;
-    encoder.set_rate(TARGET_RATE as i32);
-    encoder.set_channel_layout(ffmpeg_next::ChannelLayout::MONO);
-    encoder.set_format(ffmpeg_next::format::Sample::I16(
+    let mut enc = codec::context::Context::new_with_codec(pcm_codec)
+        .encoder()
+        .audio()?;
+    enc.set_rate(TARGET_RATE as i32);
+    enc.set_channel_layout(ffmpeg_next::ChannelLayout::MONO);
+    enc.set_format(ffmpeg_next::format::Sample::I16(
         ffmpeg_next::format::sample::Type::Packed,
     ));
-    encoder.set_time_base(ffmpeg_next::Rational::new(1, TARGET_RATE as i32));
-    let mut encoder = encoder.open()?;
+    enc.set_time_base(ffmpeg_next::Rational::new(1, TARGET_RATE as i32));
+    let mut encoder = enc.open_as(pcm_codec)?;
+
+    // Register the output stream from the opened encoder, then write the
+    // header. Scoped so the mutable borrow of `output_ctx` is released before
+    // `write_header()`.
+    let out_stream_index = {
+        let mut out_stream = output_ctx.add_stream(pcm_codec)?;
+        out_stream.set_parameters(&encoder);
+        out_stream.index()
+    };
+    output_ctx.write_header()?;
+
+    let out_time_base = output_ctx.stream(out_stream_index).unwrap().time_base();
 
     let mut output_pts: i64 = 0;
 
@@ -236,7 +271,13 @@ fn transcode_audio(
                 }
             }
 
-            let mut resampled = AudioFrame::empty();
+            // Match the frame's layout to the resampler's configured input
+            // (see `in_layout` above) so UNSPEC-layout PCM frames are accepted.
+            if decoded_frame.channel_layout().is_empty() {
+                decoded_frame.set_channel_layout(in_layout);
+            }
+
+            let mut resampled = mono_s16_frame(decoded_frame.samples());
             resampler.run(&decoded_frame, &mut resampled)?;
 
             if resampled.samples() > 0 {
@@ -257,7 +298,10 @@ fn transcode_audio(
     // Flush decoder.
     decoder.send_eof()?;
     while decoder.receive_frame(&mut decoded_frame).is_ok() {
-        let mut resampled = AudioFrame::empty();
+        if decoded_frame.channel_layout().is_empty() {
+            decoded_frame.set_channel_layout(in_layout);
+        }
+        let mut resampled = mono_s16_frame(decoded_frame.samples());
         resampler.run(&decoded_frame, &mut resampled)?;
         if resampled.samples() > 0 {
             resampled.set_pts(Some(output_pts));
@@ -275,7 +319,7 @@ fn transcode_audio(
 
     // Flush resampler (buffered samples).
     loop {
-        let mut resampled = AudioFrame::empty();
+        let mut resampled = mono_s16_frame(TARGET_RATE as usize);
         let delay = resampler.flush(&mut resampled)?;
         if resampled.samples() > 0 {
             resampled.set_pts(Some(output_pts));
@@ -421,5 +465,161 @@ mod tests {
         assert!(!is_video_file("audio.wav"));
         assert!(!is_video_file("voice.flac"));
         assert!(!is_video_file("podcast.ogg"));
+    }
+
+    /// Write a `secs`-second 16 kHz mono s16le sine-tone WAV to `path`.
+    fn write_test_wav(path: &Path, secs: u32) {
+        write_test_wav_with(path, secs, 1, TARGET_RATE);
+    }
+
+    /// Write a `secs`-second interleaved s16le sine-tone WAV with the given
+    /// channel count and sample rate. Used to exercise the real downmix +
+    /// resample path (e.g. stereo/5.1 @ 48 kHz -> mono @ 16 kHz).
+    fn write_test_wav_with(path: &Path, secs: u32, channels: u16, rate: u32) {
+        use std::io::Write;
+
+        let frames = rate * secs;
+        let block_align = channels * 2; // s16le
+        let data_len = frames * u32::from(block_align);
+        let mut buf = Vec::with_capacity(44 + data_len as usize);
+
+        // RIFF / WAVE header
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        // fmt chunk
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        buf.extend_from_slice(&channels.to_le_bytes());
+        buf.extend_from_slice(&rate.to_le_bytes());
+        buf.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes()); // byte rate
+        buf.extend_from_slice(&block_align.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        // data chunk
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..frames {
+            let t = f64::from(i) / f64::from(rate);
+            let sample = (8000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16;
+            for _ in 0..channels {
+                buf.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+
+        let mut f = std::fs::File::create(path).expect("create test wav");
+        f.write_all(&buf).expect("write test wav");
+    }
+
+    /// Regression test for the codec-less-encoder bug: `transcode_audio` once
+    /// built its output encoder from a bare `Context::new()` (no codec) and
+    /// called `.open()`, which fails inside `avcodec_open2` with "No codec
+    /// provided to avcodec_open2()". That broke EVERY `extract_segment` call, so
+    /// `/asr` multi-chunk language detection always returned 0 successful chunks
+    /// ("language detection failed"). This test extracts a segment and asserts
+    /// the result is a valid, non-empty, decodable WAV.
+    #[test]
+    fn extract_segment_produces_valid_wav() {
+        init();
+
+        let input = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        write_test_wav(&input, 5);
+
+        let output = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+
+        extract_segment(&input, &output, 1.0, 2.0).expect("extract_segment should succeed");
+
+        let meta = std::fs::metadata(&output).expect("output wav exists");
+        assert!(meta.len() > 44, "output wav must contain PCM beyond header");
+
+        // The extracted segment must itself be a decodable media file.
+        let dur = get_duration(&output).expect("extracted segment must be decodable");
+        assert!(
+            dur > 0.5,
+            "extracted segment duration should be > 0.5s, got {dur}"
+        );
+    }
+
+    /// Companion to the above for the full-file extraction path
+    /// (`extract_audio`, used by the video/`/asr` track-selection path).
+    #[test]
+    fn extract_audio_produces_valid_wav() {
+        init();
+
+        let input = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        write_test_wav(&input, 3);
+
+        let output = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+
+        extract_audio(&input, &output, None).expect("extract_audio should succeed");
+
+        let meta = std::fs::metadata(&output).expect("output wav exists");
+        assert!(meta.len() > 44, "output wav must contain PCM beyond header");
+        let dur = get_duration(&output).expect("extracted audio must be decodable");
+        assert!(
+            dur > 1.0,
+            "extracted audio duration should be > 1s, got {dur}"
+        );
+    }
+
+    /// Exercises the real downmix + downsample path that the video/`/asr` route
+    /// hits with broadcast audio (e.g. 5.1 @ 48 kHz eac3): a multi-channel,
+    /// non-16 kHz source must be converted to 16 kHz mono without the resampler
+    /// rejecting frames. Mirrors the codec found on the failing MasterChef
+    /// episodes (stereo stand-in keeps the test fixture trivial to synthesize).
+    #[test]
+    fn extract_segment_downmixes_and_resamples() {
+        init();
+
+        let input = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+        // Stereo, 48 kHz — different channel count AND rate from the target.
+        write_test_wav_with(&input, 4, 2, 48_000);
+
+        let output = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .unwrap()
+            .into_temp_path();
+
+        extract_segment(&input, &output, 1.0, 2.0)
+            .expect("extract_segment should downmix + resample successfully");
+
+        let dur = get_duration(&output).expect("extracted segment must be decodable");
+        assert!(
+            dur > 0.5,
+            "resampled segment duration should be > 0.5s, got {dur}"
+        );
+
+        // The output must be 16 kHz mono.
+        let probed = format::input(&output).expect("probe output");
+        let astream = probed
+            .streams()
+            .best(MediaType::Audio)
+            .expect("output has an audio stream");
+        let params = astream.parameters();
+        let ctx = codec::context::Context::from_parameters(params).unwrap();
+        let dec = ctx.decoder().audio().unwrap();
+        assert_eq!(dec.rate(), TARGET_RATE, "output must be 16 kHz");
+        assert_eq!(dec.channels(), 1, "output must be mono");
     }
 }
