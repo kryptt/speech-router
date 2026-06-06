@@ -1,6 +1,6 @@
 [package]
 name = "speech-router"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 
 [dependencies]
@@ -20,6 +20,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Used in tests to deserialize AsrParams from a query string, exercising the
+# `encode` default the way axum's Query extractor does at runtime.
+serde_urlencoded = "0.7"
 
 [profile.release]
 lto = true

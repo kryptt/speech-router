@@ -844,12 +844,27 @@ async fn send_with_failover(
 
 pub async fn handle_detect_language(
     State(state): State<AsrState>,
+    Query(params): Query<AsrParams>,
     multipart: Multipart,
 ) -> Response {
-    let audio = match extract_audio_file(multipart).await {
+    let mut audio = match extract_audio_file(multipart).await {
         Ok(a) => a,
         Err(resp) => return resp,
     };
+
+    // When encode=false the upload is raw 16-bit signed-integer PCM at 16 kHz
+    // mono (Bazarr's whisperai provider ffmpeg-encodes to headerless s16le and
+    // sends encode=false to BOTH /asr and /detect-language). Wrap it in a WAV
+    // header so ffmpeg can decode it — without this, detection ffprobe fails
+    // with "Invalid data found", Bazarr sees an empty language code, and
+    // subtitle generation aborts as "isn't valid for this file" for any media
+    // lacking an audio-language tag. Mirrors handle_asr.
+    if !params.encode {
+        audio = match wrap_raw_pcm_as_wav(audio).await {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        };
+    }
 
     // If the upload is a video container, extract its first audio track.
     let audio = if ffmpeg::is_video_file(&audio.file_name) {
@@ -1283,6 +1298,52 @@ mod tests {
     fn task_default_is_transcribe() {
         assert_eq!(AsrTask::default(), AsrTask::Transcribe);
     }
+
+    #[test]
+    fn asr_params_encode_defaults_true_and_parses_false() {
+        // Bazarr always sends encode=false (it pre-encodes to raw s16le PCM)
+        // to BOTH /asr and /detect-language; default must stay true for the
+        // OpenAI-style passthrough callers.
+        let dflt: AsrParams = serde_urlencoded::from_str("").unwrap();
+        assert!(dflt.encode, "encode must default to true");
+        let off: AsrParams = serde_urlencoded::from_str("encode=false").unwrap();
+        assert!(!off.encode, "encode=false must parse to false");
+    }
+
+    /// Regression for the "isn't valid for this file" failure: Bazarr posts
+    /// headerless raw s16le PCM with encode=false. `wrap_raw_pcm_as_wav` must
+    /// turn it into a WAV that ffmpeg can decode, otherwise /detect-language
+    /// ffprobe fails ("Invalid data found"), Bazarr gets an empty language
+    /// code, and subtitle generation aborts for any media without an
+    /// audio-language tag.
+    #[tokio::test]
+    async fn wrap_raw_pcm_as_wav_yields_decodable_wav() {
+        crate::ffmpeg::init();
+
+        // 2 seconds of 16 kHz mono s16le silence — headerless raw PCM.
+        let pcm = vec![0u8; (TARGET_RATE_HZ * 2 * 2) as usize];
+        let named = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(named.path(), &pcm).unwrap();
+        let input = AudioFile {
+            temp_path: named.into_temp_path(),
+            file_name: "audio".to_string(),
+        };
+
+        let wrapped = wrap_raw_pcm_as_wav(input)
+            .await
+            .map_err(|_| "wrap_raw_pcm_as_wav returned an error response")
+            .expect("raw PCM should wrap into a WAV");
+
+        let dur = crate::ffmpeg::get_duration(&wrapped.temp_path)
+            .expect("wrapped WAV must be decodable by ffmpeg");
+        assert!(
+            (dur - 2.0).abs() < 0.2,
+            "wrapped WAV duration should be ~2s, got {dur}"
+        );
+    }
+
+    /// 16 kHz, named to match the WAV header written by `wrap_raw_pcm_as_wav`.
+    const TARGET_RATE_HZ: u32 = 16_000;
 
     // -----------------------------------------------------------------------
     // decide_task
