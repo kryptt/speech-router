@@ -1,2 +1,9 @@
 /target
 /.grepai/
+/.zitadel-claude-admin.json
+/.envrc-local
+/.envrc-kai
+/logs/
+/latest
+/.claude/
+/containers/
