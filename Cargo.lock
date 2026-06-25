@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "speech-router"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -1285,6 +1285,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tempfile",
  "thiserror",
  "tokio",

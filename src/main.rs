@@ -346,10 +346,10 @@ async fn health_route(State(state): State<AppState>) -> Response {
     //
     // Healthy if ANY configured upstream responds: speech-router can serve STT
     // via failover, so readiness must not be gated on the primary alone. If it
-    // were, a primary (rh-anine) outage would fail the readiness probe and pull
-    // speech-router out of its Service endpoints — a total STT outage that
-    // *defeats* the CUDA failover (plan 2026-06-02-003). We only report
-    // unhealthy when every upstream is unreachable.
+    // were, a primary STT upstream outage would fail the readiness probe and
+    // pull speech-router out of its Service endpoints — a total STT outage that
+    // *defeats* the failover. We only report unhealthy when every upstream is
+    // unreachable.
     if state.config.stt_upstreams.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

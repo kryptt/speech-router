@@ -429,12 +429,12 @@ async fn select_and_transcribe(
 /// order: the first upstream that yields a detection wins.
 ///
 /// Detection runs *before* the transcribe/translate call, so if it stayed
-/// pinned to the primary, an rh-anine outage would fail `/asr` (Bazarr) at the
-/// detection step and never reach the failover-capable transcription. Unlike
-/// the transcription failover, this falls through on ANY detection error (not
-/// only transport failures): detection is best-effort and has no partial-
-/// response risk, so a failure on the primary should still try the backup
-/// (plan 2026-06-02-003).
+/// pinned to the primary, an outage of the primary STT upstream would fail
+/// `/asr` (Bazarr) at the detection step and never reach the failover-capable
+/// transcription. Unlike the transcription failover, this falls through on ANY
+/// detection error (not only transport failures): detection is best-effort and
+/// has no partial-response risk, so a failure on the primary should still try
+/// the backup.
 async fn detect_language_with_failover(
     stt_bases: &[String],
     model: &str,
