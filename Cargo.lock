@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "speech-router"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -1290,6 +1290,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

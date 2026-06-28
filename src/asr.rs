@@ -299,6 +299,15 @@ pub struct AsrState {
     pub node_states: SharedNodeStates,
 }
 
+/// Result of a successful multipart failover — the upstream's response
+/// regardless of HTTP status (any response = node alive).
+#[derive(Debug)]
+pub(crate) struct UpstreamResult {
+    pub status: StatusCode,
+    pub body: bytes::Bytes,
+    pub content_type: Option<HeaderValue>,
+}
+
 // ---------------------------------------------------------------------------
 // POST /asr
 // ---------------------------------------------------------------------------
@@ -674,18 +683,14 @@ async fn select_and_transcribe_audio(
 // Speaches request builder + ordered failover
 // ---------------------------------------------------------------------------
 
-/// Build a fresh transcription/translation multipart form, reopening the audio
-/// file each time. A `reqwest` body stream is single-use, so every failover
-/// attempt needs its own `Form` built from a newly-opened file handle.
-async fn build_transcription_form(
+/// Build a multipart form streaming the audio file with arbitrary text fields.
+/// Re-opens the file each call (streams are single-use).
+async fn build_streaming_form(
     audio_path: &Path,
-    language: &str,
-    task: AsrTask,
-    response_format: &str,
-    model: &str,
+    fields: &[(String, String)],
 ) -> Result<reqwest::multipart::Form, Response> {
     let file = tokio::fs::File::open(audio_path).await.map_err(|e| {
-        tracing::warn!(error = %e, "failed to open audio file for stt backend");
+        tracing::warn!(error = %e, "failed to open audio file for upstream");
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal I/O error")
     })?;
 
@@ -698,60 +703,40 @@ async fn build_transcription_form(
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         })?;
 
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("model", model.to_string())
-        .text("response_format", response_format.to_string())
-        .text("temperature", "0.0")
-        .text("language", language.to_string());
-    if task.is_translate() {
-        // whisper.cpp translates to English via this form field; there is no
-        // separate /v1/audio/translations route.
-        form = form.text("translate", "true");
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    for (name, value) in fields {
+        form = form.text(name.clone(), value.clone());
     }
     Ok(form)
 }
 
-/// Send a transcription/translation request to the STT backend, failing over
-/// through `stt_bases` in order, and return the formatted HTTP response.
+/// Ordered failover for multipart STT requests.
 ///
-/// Failover triggers ONLY on a transport-level failure (see
-/// [`is_transport_failure`]): if an upstream returns any HTTP response it is
-/// considered alive and that response is surfaced as-is — so a broken-but-
-/// responding node is never masked and a llama-swap cold-load 503 is never
-/// mistaken for an outage (plan 2026-06-02-003, R3). Each attempt rebuilds the
-/// multipart form from a freshly-opened file. A per-upstream `served` /
-/// `fell_through` metric records the outcome.
-#[allow(clippy::too_many_arguments)]
-async fn send_with_failover(
+/// Iterates `stt_bases` (reordered by node state), building a fresh form per
+/// attempt. Failover triggers ONLY on transport-level failures — any HTTP
+/// response (including 503) means the node is alive and is returned as-is.
+pub(crate) async fn multipart_failover(
     audio_path: &Path,
-    language: &str,
-    task: AsrTask,
-    output: AsrOutput,
-    response_format: &str,
-    model: &str,
+    fields: &[(String, String)],
     stt_bases: &[String],
     states: &NodeStates,
+    model: &str,
     client: &reqwest::Client,
     metrics: &Metrics,
-) -> Result<Response, Response> {
-    // Reorder by current node state for the model actually requested (transcribe
-    // vs translate may differ). A permutation of `stt_bases` — the loop still
-    // iterates every upstream, so the transport-failover floor is unchanged (R5).
+) -> Result<UpstreamResult, Response> {
     let (order, decision) = ordered_upstreams(stt_bases, states, model);
     metrics.record_routing_decision(decision);
     let last_idx = order.len().saturating_sub(1);
 
     for (idx, stt_base) in order.iter().enumerate() {
         let is_last = idx == last_idx;
-        let form =
-            build_transcription_form(audio_path, language, task, response_format, model).await?;
+        let form = build_streaming_form(audio_path, fields).await?;
         let url = transcription_url(stt_base, model);
 
-        let record_fell_through = |stt_base: &str| {
+        let record_fell_through = |base: &str| {
             metrics
                 .stt_upstream_attempts
-                .get_or_create(&stt_upstream_labels(stt_base, "fell_through"))
+                .get_or_create(&stt_upstream_labels(base, "fell_through"))
                 .inc();
         };
 
@@ -759,38 +744,23 @@ async fn send_with_failover(
             Ok(upstream) => {
                 let status = StatusCode::from_u16(upstream.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let content_type = upstream
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
 
                 match upstream.bytes().await {
                     Ok(body) => {
-                        // Record `served` only once the full response body has
-                        // arrived — a send that succeeds but whose body read
-                        // fails was not actually served.
                         metrics
                             .stt_upstream_attempts
                             .get_or_create(&stt_upstream_labels(stt_base, "served"))
                             .inc();
-
-                        let content_type = content_type_for(output);
-                        let mut response = (status, body).into_response();
-                        response.headers_mut().insert(
-                            axum::http::header::CONTENT_TYPE,
-                            HeaderValue::from_static(content_type),
-                        );
-                        if output == AsrOutput::Srt {
-                            response.headers_mut().insert(
-                                axum::http::header::CONTENT_DISPOSITION,
-                                HeaderValue::from_static(
-                                    "attachment; filename=\"transcription.srt\"",
-                                ),
-                            );
-                        }
-                        return Ok(response);
+                        return Ok(UpstreamResult {
+                            status,
+                            body,
+                            content_type,
+                        });
                     }
-                    // A mid-body transport failure (upstream accepted the
-                    // connection then reset/timed out) is still a dead-upstream
-                    // signal. Nothing has been sent to the client yet — the body
-                    // is buffered here, not streamed — so fail over like a
-                    // connect error rather than returning a 502.
                     Err(e) if is_transport_failure(&e) && !is_last => {
                         tracing::warn!(error = %e, upstream = %stt_base, "stt response read failed mid-body, failing over to next");
                         record_fell_through(stt_base);
@@ -817,8 +787,6 @@ async fn send_with_failover(
                 continue;
             }
             Err(e) => {
-                // Record the final upstream's transport failure too, so the
-                // metric reflects every failed attempt (not just fell-overs).
                 if is_transport_failure(&e) {
                     record_fell_through(stt_base);
                 }
@@ -831,11 +799,53 @@ async fn send_with_failover(
         }
     }
 
-    // Reachable only if stt_bases is empty (handlers guard against this first).
     Err(error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "no STT upstream configured",
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_with_failover(
+    audio_path: &Path,
+    language: &str,
+    task: AsrTask,
+    output: AsrOutput,
+    response_format: &str,
+    model: &str,
+    stt_bases: &[String],
+    states: &NodeStates,
+    client: &reqwest::Client,
+    metrics: &Metrics,
+) -> Result<Response, Response> {
+    let mut fields = vec![
+        ("model".to_string(), model.to_string()),
+        ("response_format".to_string(), response_format.to_string()),
+        ("temperature".to_string(), "0.0".to_string()),
+        ("language".to_string(), language.to_string()),
+    ];
+    if task.is_translate() {
+        fields.push(("translate".to_string(), "true".to_string()));
+    }
+
+    let result = multipart_failover(
+        audio_path, &fields, stt_bases, states, model, client, metrics,
+    )
+    .await?;
+
+    let content_type = content_type_for(output);
+    let mut response = (result.status, result.body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    if output == AsrOutput::Srt {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=\"transcription.srt\""),
+        );
+    }
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,6 +1265,170 @@ async fn wrap_raw_pcm_as_wav(audio: AudioFile) -> Result<AudioFile, Response> {
 }
 
 // ---------------------------------------------------------------------------
+// POST /v1/audio/transcriptions  (OpenAI-compatible, with format conversion)
+// ---------------------------------------------------------------------------
+
+/// Formats whisper.cpp decodes natively (WAV via drwav, MP3 via minimp3,
+/// FLAC via drflac). Anything else is converted to WAV before forwarding.
+const WHISPER_NATIVE_EXTS: &[&str] = &["wav", "mp3", "flac"];
+
+fn needs_format_conversion(file_name: &str) -> bool {
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !WHISPER_NATIVE_EXTS.contains(&ext.as_str())
+}
+
+/// Parsed OpenAI `/v1/audio/transcriptions` multipart request.
+struct TranscriptionParts {
+    audio: AudioFile,
+    /// Non-file form fields forwarded verbatim to the upstream.
+    fields: Vec<(String, String)>,
+}
+
+async fn extract_transcription_parts(
+    mut multipart: Multipart,
+) -> Result<TranscriptionParts, Response> {
+    let mut audio: Option<AudioFile> = None;
+    let mut fields = Vec::new();
+
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        tracing::warn!(error = %e, "multipart parse error");
+        error_response(StatusCode::BAD_REQUEST, "invalid multipart body")
+    })? {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            let file_name = field.file_name().unwrap_or("audio.wav").to_string();
+            let named = tempfile::NamedTempFile::new().map_err(|e| {
+                tracing::warn!(error = %e, "failed to create temp file");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "temp file error")
+            })?;
+            let temp_path = named.into_temp_path();
+
+            let mut out = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+                tracing::warn!(error = %e, "failed to open temp file for writing");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "I/O error")
+            })?;
+            let mut stream = field.into_stream();
+            while let Some(chunk) = stream.try_next().await.map_err(|e| {
+                tracing::warn!(error = %e, "failed to read file chunk");
+                error_response(StatusCode::BAD_REQUEST, "failed to read file")
+            })? {
+                out.write_all(&chunk).await.map_err(|e| {
+                    tracing::warn!(error = %e, "failed to write chunk");
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "I/O error")
+                })?;
+            }
+            out.flush().await.map_err(|e| {
+                tracing::warn!(error = %e, "failed to flush temp file");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "I/O error")
+            })?;
+            audio = Some(AudioFile {
+                temp_path,
+                file_name,
+            });
+        } else {
+            let value = field.text().await.unwrap_or_default();
+            fields.push((name, value));
+        }
+    }
+
+    let audio =
+        audio.ok_or_else(|| error_response(StatusCode::BAD_REQUEST, "missing 'file' field"))?;
+    Ok(TranscriptionParts { audio, fields })
+}
+
+/// Convert audio to 16 kHz mono WAV via ffmpeg.
+async fn convert_to_wav(audio: AudioFile) -> Result<AudioFile, Response> {
+    let wav_named = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| {
+            tracing::warn!(error = %e, "failed to create wav temp file");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "temp file error")
+        })?;
+    let wav_path = wav_named.into_temp_path();
+
+    let input = audio.temp_path.to_path_buf();
+    let output = wav_path.to_path_buf();
+    tokio::task::spawn_blocking(move || ffmpeg::extract_audio(&input, &output, None))
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "ffmpeg task panicked");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "audio conversion failed")
+        })?
+        .map_err(|e| {
+            tracing::warn!(error = %e, "ffmpeg conversion failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "audio format conversion failed",
+            )
+        })?;
+
+    Ok(AudioFile {
+        temp_path: wav_path,
+        file_name: "audio.wav".to_string(),
+    })
+}
+
+/// OpenAI-compatible `/v1/audio/transcriptions` handler.
+///
+/// Parses the multipart upload, converts non-native audio formats (OGG, etc.)
+/// to WAV for whisper.cpp compatibility, and forwards with ordered failover
+/// across STT upstreams.
+pub async fn handle_openai_transcriptions(
+    State(state): State<AsrState>,
+    multipart: Multipart,
+) -> Response {
+    if state.stt_upstreams.is_empty() {
+        return error_response(StatusCode::BAD_GATEWAY, "no STT upstream configured");
+    }
+
+    let parts = match extract_transcription_parts(multipart).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let audio = if needs_format_conversion(&parts.audio.file_name) {
+        tracing::info!(
+            file = %parts.audio.file_name,
+            "converting audio to WAV for whisper.cpp"
+        );
+        match convert_to_wav(parts.audio).await {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        }
+    } else {
+        parts.audio
+    };
+
+    let snapshot = state.node_states.load_full();
+    match multipart_failover(
+        &audio.temp_path,
+        &parts.fields,
+        &state.stt_upstreams,
+        &snapshot,
+        &state.stt_model,
+        &state.client,
+        &state.metrics,
+    )
+    .await
+    {
+        Ok(result) => {
+            let mut resp = (result.status, result.body).into_response();
+            if let Some(ct) = result.content_type {
+                resp.headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, ct);
+            }
+            resp
+        }
+        Err(resp) => resp,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1508,7 +1682,6 @@ mod failover_tests {
     use axum::routing::post;
     use prometheus_client::registry::Registry;
     use std::io::Write;
-    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
@@ -1549,14 +1722,7 @@ mod failover_tests {
         (format!("http://{addr}"), received, hits)
     }
 
-    /// A base URL whose port is bound then released — connecting refuses, which
-    /// is the transport failure that triggers failover.
-    async fn closed_addr() -> String {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a: SocketAddr = l.local_addr().unwrap();
-        drop(l);
-        format!("http://{a}")
-    }
+    use crate::test_util::closed_addr;
 
     fn audio_temp() -> tempfile::TempPath {
         let mut f = tempfile::NamedTempFile::new().unwrap();

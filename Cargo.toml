@@ -1,6 +1,6 @@
 [package]
 name = "speech-router"
-version = "0.6.2"
+version = "0.8.0"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Used in tests to deserialize AsrParams from a query string, exercising the
 # `encode` default the way axum's Query extractor does at runtime.
 serde_urlencoded = "0.7"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = true

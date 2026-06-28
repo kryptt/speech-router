@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::metrics::{Metrics, stt_upstream_labels};
-use crate::node_state::{NodeStates, SharedNodeStates, ordered_upstreams};
-use crate::proxy::is_transport_failure;
+use crate::metrics::Metrics;
+use crate::node_state::SharedNodeStates;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -280,150 +280,123 @@ fn info_event(config: &Config) -> Event {
 // ---------------------------------------------------------------------------
 
 /// Accumulating state for an in-progress STT transcription.
+/// Audio chunks are streamed to a temp file instead of buffered in memory.
 struct SttSession {
     language: String,
     rate: u32,
     width: u16,
     channels: u16,
-    pcm: BytesMut,
+    pcm_path: tempfile::TempPath,
+    pcm_writer: tokio::fs::File,
 }
 
 impl SttSession {
-    fn new(language: String) -> Self {
-        Self {
+    async fn new(language: String) -> Result<Self, String> {
+        let named = tempfile::NamedTempFile::new()
+            .map_err(|e| format!("failed to create PCM temp file: {e}"))?;
+        let pcm_path = named.into_temp_path();
+        let pcm_writer = tokio::fs::File::create(&pcm_path)
+            .await
+            .map_err(|e| format!("failed to open PCM temp file: {e}"))?;
+        Ok(Self {
             language,
             rate: 16000,
             width: 2,
             channels: 1,
-            pcm: BytesMut::new(),
-        }
+            pcm_path,
+            pcm_writer,
+        })
     }
 }
 
-/// Handle `audio-stop`: build WAV, POST to the STT backend (failing over
-/// through the ordered upstream list), return a transcript event.
-///
-/// The wav bytes are built once and cloned per attempt — a `reqwest` multipart
-/// body is single-use, so a failover retry needs its own copy. Failover
-/// triggers only on a transport-level failure (see [`is_transport_failure`]);
-/// any HTTP response is treated as the node being alive (plan 2026-06-02-003).
+/// Build a WAV temp file from the PCM data accumulated in `session`.
+async fn build_wav_from_pcm(session: &mut SttSession) -> Result<tempfile::TempPath, String> {
+    session
+        .pcm_writer
+        .flush()
+        .await
+        .map_err(|e| format!("flush PCM: {e}"))?;
+
+    let pcm_len = tokio::fs::metadata(&session.pcm_path)
+        .await
+        .map_err(|e| format!("stat PCM: {e}"))?
+        .len() as u32;
+    let header = wav_header(pcm_len, session.rate, session.channels, session.width);
+
+    let named = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| format!("create WAV temp: {e}"))?;
+    let wav_path = named.into_temp_path();
+    let mut out = tokio::fs::File::create(&wav_path)
+        .await
+        .map_err(|e| format!("open WAV: {e}"))?;
+    out.write_all(&header)
+        .await
+        .map_err(|e| format!("write WAV header: {e}"))?;
+    let mut pcm = tokio::fs::File::open(&session.pcm_path)
+        .await
+        .map_err(|e| format!("open PCM: {e}"))?;
+    tokio::io::copy(&mut pcm, &mut out)
+        .await
+        .map_err(|e| format!("copy PCM: {e}"))?;
+    out.flush().await.map_err(|e| format!("flush WAV: {e}"))?;
+
+    Ok(wav_path)
+}
+
+/// POST the WAV to the STT backend via the shared failover helper, parse the
+/// JSON transcript, and return a Wyoming transcript event.
 async fn finish_stt(
-    session: &SttSession,
+    wav_path: &Path,
+    language: &str,
     config: &Config,
-    states: &NodeStates,
+    states: &crate::node_state::NodeStates,
     client: &reqwest::Client,
     metrics: &Metrics,
 ) -> Result<Event, String> {
-    let pcm_len = session.pcm.len() as u32;
-    let header = wav_header(pcm_len, session.rate, session.channels, session.width);
-
-    let mut wav = Vec::with_capacity(44 + session.pcm.len());
-    wav.extend_from_slice(&header);
-    wav.extend_from_slice(&session.pcm);
-
     if config.stt_upstreams.is_empty() {
         return Err("no STT upstream configured".to_string());
     }
-    // Reorder by current node state (R1–R4); a permutation of stt_upstreams, so
-    // the transport-failover loop below still tries every upstream (R5).
-    let (order, decision) = ordered_upstreams(&config.stt_upstreams, states, &config.stt_model);
-    metrics.record_routing_decision(decision);
-    let last_idx = order.len() - 1;
 
-    let mut last_err = String::new();
-    for (idx, stt_base) in order.iter().enumerate() {
-        let is_last = idx == last_idx;
+    let fields = vec![
+        ("model".to_string(), config.stt_model.clone()),
+        ("language".to_string(), language.to_string()),
+        ("response_format".to_string(), "json".to_string()),
+    ];
 
-        // Clone the wav per attempt — the multipart body is single-use.
-        let part = reqwest::multipart::Part::bytes(wav.clone())
-            .file_name("audio.wav")
-            .mime_str("audio/wav")
-            .map_err(|e| format!("mime error: {e}"))?;
+    let result = crate::asr::multipart_failover(
+        wav_path,
+        &fields,
+        &config.stt_upstreams,
+        states,
+        &config.stt_model,
+        client,
+        metrics,
+    )
+    .await
+    .map_err(|resp| format!("stt upstream failed ({})", resp.status()))?;
 
-        let form = reqwest::multipart::Form::new()
-            .part("file", part)
-            .text("model", config.stt_model.clone())
-            .text("language", session.language.clone())
-            .text("response_format", "json");
-
-        let url = format!(
-            "{stt_base}/upstream/{}/v1/audio/transcriptions",
-            config.stt_model
-        );
-
-        let record_fell_through = |stt_base: &str| {
-            metrics
-                .stt_upstream_attempts
-                .get_or_create(&stt_upstream_labels(stt_base, "fell_through"))
-                .inc();
-        };
-        let record_served = |stt_base: &str| {
-            metrics
-                .stt_upstream_attempts
-                .get_or_create(&stt_upstream_labels(stt_base, "served"))
-                .inc();
-        };
-
-        let resp = match client.post(&url).multipart(form).send().await {
-            Ok(resp) => resp,
-            Err(e) if is_transport_failure(&e) && !is_last => {
-                warn!(error = %e, upstream = %stt_base, "wyoming stt upstream unreachable, failing over");
-                record_fell_through(stt_base);
-                last_err = format!("stt backend request failed: {e}");
-                continue;
-            }
-            Err(e) => {
-                if is_transport_failure(&e) {
-                    record_fell_through(stt_base);
-                }
-                return Err(format!("stt backend request failed: {e}"));
-            }
-        };
-
-        if !resp.status().is_success() {
-            // The upstream responded (even with an error status) — it is alive,
-            // so this counts as served; surface the error (caller falls back to
-            // an empty transcript). A cold-load 503 is intentionally NOT failed
-            // over.
-            record_served(stt_base);
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("stt backend returned {status}: {body}"));
-        }
-
-        match resp.json::<serde_json::Value>().await {
-            Ok(body) => {
-                record_served(stt_base);
-                let text = body
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let data = serde_json::json!({"text": text});
-                return Ok(make_event("transcript", Some(&data), &[]));
-            }
-            // Mid-body transport failure: nothing emitted to the client yet, so
-            // fail over to the next upstream like a connect error.
-            Err(e) if is_transport_failure(&e) && !is_last => {
-                warn!(error = %e, upstream = %stt_base, "wyoming stt response read failed mid-body, failing over");
-                record_fell_through(stt_base);
-                last_err = format!("stt backend read failed: {e}");
-                continue;
-            }
-            Err(e) => {
-                if is_transport_failure(&e) {
-                    record_fell_through(stt_base);
-                }
-                return Err(format!("invalid JSON from stt backend: {e}"));
-            }
-        }
+    if !result.status.is_success() {
+        let body_text = String::from_utf8_lossy(&result.body);
+        return Err(format!(
+            "stt backend returned {}: {body_text}",
+            result.status
+        ));
     }
 
-    Err(if last_err.is_empty() {
-        "no STT upstream configured".to_string()
-    } else {
-        last_err
-    })
+    let body: serde_json::Value = serde_json::from_slice(&result.body)
+        .map_err(|e| format!("invalid JSON from stt backend: {e}"))?;
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(make_event(
+        "transcript",
+        Some(&serde_json::json!({"text": text})),
+        &[],
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +425,7 @@ async fn handle_tts<W: AsyncWriteExt + Unpin>(
         "sample_rate": TTS_SAMPLE_RATE,
     });
 
-    let resp = client
+    let mut resp = client
         .post(&url)
         .timeout(std::time::Duration::from_secs(30))
         .json(&body)
@@ -477,21 +450,17 @@ async fn handle_tts<W: AsyncWriteExt + Unpin>(
         .await
         .map_err(|e| format!("write error: {e}"))?;
 
-    // Stream response body in chunks
-    let pcm_bytes = resp
-        .bytes()
+    // Stream response body directly to Wyoming client
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("failed to read TTS response: {e}"))?;
-
-    let mut remaining = &pcm_bytes[..];
-    while !remaining.is_empty() {
-        let chunk_len = remaining.len().min(TTS_CHUNK_SIZE);
-        let (chunk, rest) = remaining.split_at(chunk_len);
-        remaining = rest;
-
-        write_event(writer, &make_event("audio-chunk", Some(&audio_fmt), chunk))
-            .await
-            .map_err(|e| format!("write error: {e}"))?;
+        .map_err(|e| format!("failed to read TTS chunk: {e}"))?
+    {
+        for sub in chunk.chunks(TTS_CHUNK_SIZE) {
+            write_event(writer, &make_event("audio-chunk", Some(&audio_fmt), sub))
+                .await
+                .map_err(|e| format!("write error: {e}"))?;
+        }
     }
 
     // audio-stop
@@ -562,7 +531,10 @@ async fn handle_connection(
                         .unwrap_or("en")
                         .to_string()
                 };
-                stt_session = Some(SttSession::new(language));
+                match SttSession::new(language).await {
+                    Ok(s) => stt_session = Some(s),
+                    Err(e) => warn!(%addr, error = %e, "failed to create STT session"),
+                }
             }
 
             "audio-start" => {
@@ -580,23 +552,38 @@ async fn handle_connection(
                             }
                         }
                     }
-                    session.pcm.clear();
                 }
             }
 
             "audio-chunk" => {
                 if let Some(ref mut session) = stt_session {
-                    session.pcm.extend_from_slice(&event.payload);
+                    if let Err(e) = session.pcm_writer.write_all(&event.payload).await {
+                        warn!(%addr, error = %e, "failed to write audio chunk");
+                        break;
+                    }
                 }
             }
 
             "audio-stop" => {
-                if let Some(ref session) = stt_session {
-                    // Read the snapshot per transcription so reordering reflects
-                    // the latest node state (lock-free, off the hot path).
-                    // `load_full` clones the inner Arc so it is safe across awaits.
-                    let snapshot = node_states.load_full();
-                    match finish_stt(session, &config, &snapshot, &client, &metrics).await {
+                if let Some(ref mut session) = stt_session {
+                    let wav_result = build_wav_from_pcm(session).await;
+                    let transcript_result = match wav_result {
+                        Ok(wav_path) => {
+                            let snapshot = node_states.load_full();
+                            finish_stt(
+                                &wav_path,
+                                &session.language,
+                                &config,
+                                &snapshot,
+                                &client,
+                                &metrics,
+                            )
+                            .await
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    match transcript_result {
                         Ok(transcript) => {
                             if let Err(e) = write_event(&mut write_half, &transcript).await {
                                 warn!(%addr, error = %e, "failed to send transcript");
@@ -605,10 +592,7 @@ async fn handle_connection(
                         }
                         Err(e) => {
                             warn!(%addr, error = %e, "STT transcription failed");
-                            // Surface the (otherwise silent) outage as a metric;
-                            // a non-zero rate is the rollback trigger.
                             metrics.stt_empty_transcript_fallback.inc();
-                            // Send empty transcript on error so the client is not stuck.
                             let fallback_data = serde_json::json!({"text": ""});
                             let fallback = make_event("transcript", Some(&fallback_data), &[]);
                             if let Err(e) = write_event(&mut write_half, &fallback).await {
@@ -617,8 +601,8 @@ async fn handle_connection(
                             }
                         }
                     }
-                    stt_session = None;
                 }
+                stt_session = None;
             }
 
             // -- TTS flow --
@@ -1046,10 +1030,13 @@ mod tests {
 #[cfg(test)]
 mod failover_tests {
     use super::*;
+    use crate::metrics::stt_upstream_labels;
+    use crate::node_state::NodeStates;
+    use crate::test_util::closed_addr;
     use axum::Router;
     use axum::routing::post;
     use prometheus_client::registry::Registry;
-    use std::net::SocketAddr;
+    use std::io::Write;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
@@ -1079,13 +1066,6 @@ mod failover_tests {
         (format!("http://{addr}"), received)
     }
 
-    async fn closed_addr() -> String {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a: SocketAddr = l.local_addr().unwrap();
-        drop(l);
-        format!("http://{a}")
-    }
-
     fn cfg(bases: Vec<String>) -> Config {
         Config {
             stt_upstreams: bases,
@@ -1102,10 +1082,14 @@ mod failover_tests {
         }
     }
 
-    fn session() -> SttSession {
-        let mut s = SttSession::new("en".to_string());
-        s.pcm.extend_from_slice(&[0u8; 3200]); // ~0.1s of 16 kHz mono 16-bit PCM
-        s
+    /// Build a minimal WAV temp file with ~0.1s of silence.
+    fn test_wav() -> tempfile::TempPath {
+        let pcm = [0u8; 3200];
+        let header = wav_header(pcm.len() as u32, 16000, 1, 2);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&header).unwrap();
+        f.write_all(&pcm).unwrap();
+        f.into_temp_path()
     }
 
     #[tokio::test]
@@ -1119,15 +1103,15 @@ mod failover_tests {
             .build()
             .unwrap();
         let config = cfg(vec![down.clone(), up.clone()]);
+        let wav = test_wav();
 
-        let event = finish_stt(&session(), &config, &NodeStates::new(), &client, &metrics)
+        let event = finish_stt(&wav, "en", &config, &NodeStates::new(), &client, &metrics)
             .await
             .expect("transcript via failover");
 
         let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
         assert_eq!(event.header.event_type, "transcript");
         assert_eq!(data["text"], "hello wyoming");
-        // The wav is cloned per attempt, so the surviving upstream gets the full body.
         assert!(
             received.load(Ordering::SeqCst) >= 3244,
             "second upstream must receive the full re-materialised wav"
@@ -1148,8 +1132,9 @@ mod failover_tests {
         let metrics = Metrics::new(&mut reg);
         let client = reqwest::Client::new();
         let config = cfg(vec![up.clone()]);
+        let wav = test_wav();
 
-        let event = finish_stt(&session(), &config, &NodeStates::new(), &client, &metrics)
+        let event = finish_stt(&wav, "en", &config, &NodeStates::new(), &client, &metrics)
             .await
             .expect("transcript");
         let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();
@@ -1159,9 +1144,6 @@ mod failover_tests {
 
     #[tokio::test]
     async fn wyoming_all_upstreams_down_errors() {
-        // All upstreams unreachable -> finish_stt returns Err, which the caller
-        // (handle_connection) turns into the empty-transcript fallback + its
-        // metric. Every failed attempt is recorded.
         let down1 = closed_addr().await;
         let down2 = closed_addr().await;
         let mut reg = Registry::default();
@@ -1171,8 +1153,9 @@ mod failover_tests {
             .build()
             .unwrap();
         let config = cfg(vec![down1.clone(), down2.clone()]);
+        let wav = test_wav();
 
-        let result = finish_stt(&session(), &config, &NodeStates::new(), &client, &metrics).await;
+        let result = finish_stt(&wav, "en", &config, &NodeStates::new(), &client, &metrics).await;
         assert!(result.is_err(), "all upstreams down must return Err");
 
         let ft = |base: &str| {
@@ -1185,13 +1168,8 @@ mod failover_tests {
         assert_eq!(ft(&down2), 1);
     }
 
-    // -- state-aware reorder (Unit 3) --
-
     #[tokio::test]
     async fn wyoming_reorders_when_primary_marked_down() {
-        // Snapshot says the primary is unreachable and the failover reachable →
-        // finish_stt must hit the failover first and never attempt the (down)
-        // primary, so no fell_through is recorded for it.
         let primary = closed_addr().await;
         let (failover, received) = spawn_mock(200, r#"{"text":"warm"}"#).await;
         let mut reg = Registry::default();
@@ -1220,8 +1198,9 @@ mod failover_tests {
         ]
         .into_iter()
         .collect();
+        let wav = test_wav();
 
-        let event = finish_stt(&session(), &config, &states, &client, &metrics)
+        let event = finish_stt(&wav, "en", &config, &states, &client, &metrics)
             .await
             .expect("transcript via reordered failover");
         let data: serde_json::Value = serde_json::from_slice(&event.data).unwrap();

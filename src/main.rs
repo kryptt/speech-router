@@ -117,6 +117,10 @@ async fn main() {
     let asr_router: Router<()> = Router::new()
         .route("/asr", post(asr::handle_asr))
         .route("/detect-language", post(asr::handle_detect_language))
+        .route(
+            "/v1/audio/transcriptions",
+            post(asr::handle_openai_transcriptions),
+        )
         .route("/status", get(status_route))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GiB — raw PCM of full movies
         .with_state(asr_state);
@@ -208,12 +212,6 @@ async fn passthrough_route(
         );
     }
 
-    // STT transcriptions are rewritten onto the llama-swap /upstream/<model>
-    // path and fail over across the ordered upstream list (plan 2026-06-02-003).
-    if path == "/v1/audio/transcriptions" {
-        return passthrough_transcriptions(&state, method, uri.query(), &headers, body).await;
-    }
-
     // TTS goes to Kokoro; anything else falls back to the legacy Speaches URL
     // during the phase-out window.
     let (backend_url, fwd_path): (String, String) = match path {
@@ -239,86 +237,6 @@ async fn passthrough_route(
         body,
     })
     .await
-}
-
-/// Proxy a `/v1/audio/transcriptions` request, failing over across the ordered
-/// STT upstreams. Only a transport-level failure on a non-final upstream
-/// triggers failover; any HTTP response is returned as-is (plan
-/// 2026-06-02-003, R3). The request body is cheap to clone (`Bytes` is
-/// reference-counted) so each attempt re-sends the full payload.
-async fn passthrough_transcriptions(
-    state: &AppState,
-    method: Method,
-    query: Option<&str>,
-    headers: &HeaderMap,
-    body: Bytes,
-) -> Response {
-    if state.config.stt_upstreams.is_empty() {
-        return proxy::error_response(StatusCode::BAD_GATEWAY, "no STT upstream configured");
-    }
-    let fwd_path = format!(
-        "/upstream/{}/v1/audio/transcriptions",
-        state.config.stt_model
-    );
-    // Reorder by current node state (R1–R4); a permutation of stt_upstreams, so
-    // the transport-failover loop still tries every upstream (R5).
-    let snapshot = state.node_states.load_full();
-    let (order, decision) = node_state::ordered_upstreams(
-        &state.config.stt_upstreams,
-        &snapshot,
-        &state.config.stt_model,
-    );
-    state.metrics.record_routing_decision(decision);
-    let last_idx = order.len() - 1;
-
-    for (idx, base) in order.iter().enumerate() {
-        let is_last = idx == last_idx;
-        let result = proxy::try_forward(proxy::ProxyRequest {
-            client: &state.client,
-            backend_url: base,
-            path: &fwd_path,
-            query,
-            method: method.clone(),
-            headers,
-            body: body.clone(),
-        })
-        .await;
-
-        match result {
-            Ok(resp) => {
-                state
-                    .metrics
-                    .stt_upstream_attempts
-                    .get_or_create(&metrics::stt_upstream_labels(base, "served"))
-                    .inc();
-                return resp;
-            }
-            Err(e) if proxy::is_transport_failure(&e) && !is_last => {
-                tracing::warn!(error = %e, upstream = %base, "passthrough stt upstream unreachable, failing over");
-                state
-                    .metrics
-                    .stt_upstream_attempts
-                    .get_or_create(&metrics::stt_upstream_labels(base, "fell_through"))
-                    .inc();
-                continue;
-            }
-            Err(e) => {
-                // Record the final upstream's transport failure too, so the
-                // metric reflects every failed attempt.
-                if proxy::is_transport_failure(&e) {
-                    state
-                        .metrics
-                        .stt_upstream_attempts
-                        .get_or_create(&metrics::stt_upstream_labels(base, "fell_through"))
-                        .inc();
-                }
-                tracing::warn!(error = %e, upstream = %base, "passthrough stt request failed");
-                return proxy::error_response(StatusCode::BAD_GATEWAY, "upstream unavailable");
-            }
-        }
-    }
-
-    proxy::error_response(StatusCode::BAD_GATEWAY, "no STT upstream configured")
 }
 
 /// Synthesize a minimal OpenAI `/v1/models` listing for the audio models so
@@ -410,19 +328,30 @@ async fn metrics_route(State(state): State<AppState>) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Passthrough STT failover tests (Unit 3) — the OpenAI-compatible
-// /v1/audio/transcriptions path used by Open WebUI.
+// OpenAI transcription failover tests (Unit 3) — the /v1/audio/transcriptions
+// path used by Open WebUI and Hermes.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod passthrough_failover_tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
     use axum::routing::post;
     use prometheus_client::registry::Registry;
+    use speech_router::asr::AsrState;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
+
+    async fn closed_addr() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a: SocketAddr = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{a}")
+    }
 
     async fn spawn_mock(status: u16) -> (String, Arc<AtomicUsize>) {
         let received = Arc::new(AtomicUsize::new(0));
@@ -449,27 +378,7 @@ mod passthrough_failover_tests {
         (format!("http://{addr}"), received)
     }
 
-    async fn closed_addr() -> String {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let a: SocketAddr = l.local_addr().unwrap();
-        drop(l);
-        format!("http://{a}")
-    }
-
-    fn app_state(bases: Vec<String>) -> AppState {
-        let config = Config {
-            stt_upstreams: bases,
-            tts_url: "http://localhost:1".to_string(),
-            stt_model: "whisper".to_string(),
-            stt_translate_model: "whisper-translate".to_string(),
-            speaches_url: None,
-            public_addr: "0.0.0.0:8000".parse().unwrap(),
-            wyoming_port: 10300,
-            internal_addr: "0.0.0.0:9090".parse().unwrap(),
-            default_tts_model: "kokoro".to_string(),
-            default_tts_voice: "af_heart".to_string(),
-            state_poll_interval_secs: 0,
-        };
+    fn asr_state(bases: Vec<String>) -> AsrState {
         let mut registry = Registry::default();
         let metrics = Arc::new(Metrics::new(&mut registry));
         let client = Arc::new(
@@ -478,20 +387,18 @@ mod passthrough_failover_tests {
                 .build()
                 .unwrap(),
         );
-        AppState {
-            config: Arc::new(config),
+        AsrState {
+            stt_upstreams: bases,
+            stt_model: "whisper".to_string(),
+            stt_translate_model: "whisper".to_string(),
             client,
             metrics,
-            registry: Arc::new(registry),
             node_states: node_state::new_shared(),
         }
     }
 
-    /// Build an AppState whose node-state snapshot marks the given bases with
-    /// the supplied reachability (ready models omitted — irrelevant for these
-    /// reorder tests).
-    fn app_state_with_reachability(bases: Vec<String>, reachable: &[bool]) -> AppState {
-        let state = app_state(bases.clone());
+    fn asr_state_with_reachability(bases: Vec<String>, reachable: &[bool]) -> AsrState {
+        let state = asr_state(bases.clone());
         let snap: speech_router::node_state::NodeStates = bases
             .iter()
             .zip(reachable.iter())
@@ -509,72 +416,102 @@ mod passthrough_failover_tests {
         state
     }
 
-    fn fell_through(state: &AppState, base: &str) -> u64 {
-        state
-            .metrics
-            .stt_upstream_attempts
-            .get_or_create(&metrics::stt_upstream_labels(base, "fell_through"))
-            .get()
+    fn test_router(state: AsrState) -> Router {
+        Router::new()
+            .route(
+                "/v1/audio/transcriptions",
+                post(speech_router::asr::handle_openai_transcriptions),
+            )
+            .with_state(state)
+    }
+
+    /// Minimal valid WAV wrapped in a multipart form body.
+    fn wav_multipart() -> (String, Vec<u8>) {
+        let boundary = "testboundary";
+        // 44-byte WAV header, 0 data samples — valid container.
+        let wav: &[u8] = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\
+            \x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00\
+            data\x00\x00\x00\x00";
+        let header = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\
+             Content-Type: audio/wav\r\n\r\n"
+        );
+        let footer = format!("\r\n--{boundary}--\r\n");
+        let mut body = Vec::new();
+        body.extend_from_slice(header.as_bytes());
+        body.extend_from_slice(wav);
+        body.extend_from_slice(footer.as_bytes());
+        (boundary.to_string(), body)
+    }
+
+    fn transcription_req(boundary: &str, body: Vec<u8>) -> Request<Body> {
+        Request::post("/v1/audio/transcriptions")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn passthrough_fails_over_to_second_upstream() {
+    async fn transcription_fails_over_to_second_upstream() {
         let down = closed_addr().await;
         let (up, received) = spawn_mock(200).await;
-        let state = app_state(vec![down.clone(), up.clone()]);
+        let state = asr_state(vec![down.clone(), up.clone()]);
+        let fell = state.metrics.clone();
+        let router = test_router(state);
 
-        let resp = passthrough_transcriptions(
-            &state,
-            Method::POST,
-            None,
-            &HeaderMap::new(),
-            Bytes::from_static(&[7u8; 1500]),
-        )
-        .await;
+        let (b, body) = wav_multipart();
+        let resp = router.oneshot(transcription_req(&b, body)).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            received.load(Ordering::SeqCst) >= 1500,
-            "second upstream must receive the full re-sent body"
+            received.load(Ordering::SeqCst) > 0,
+            "second upstream must receive the request"
         );
-        assert_eq!(fell_through(&state, &down), 1);
+        // Verify fell_through was recorded for the down upstream.
+        let ft = fell
+            .stt_upstream_attempts
+            .get_or_create(&metrics::stt_upstream_labels(&down, "fell_through"))
+            .get();
+        assert_eq!(ft, 1);
     }
 
     #[tokio::test]
-    async fn passthrough_all_down_is_bad_gateway() {
+    async fn transcription_all_down_is_bad_gateway() {
         let down1 = closed_addr().await;
         let down2 = closed_addr().await;
-        let state = app_state(vec![down1.clone(), down2.clone()]);
+        let state = asr_state(vec![down1.clone(), down2.clone()]);
+        let fell = state.metrics.clone();
+        let router = test_router(state);
 
-        let resp = passthrough_transcriptions(
-            &state,
-            Method::POST,
-            None,
-            &HeaderMap::new(),
-            Bytes::from_static(&[0u8; 64]),
-        )
-        .await;
+        let (b, body) = wav_multipart();
+        let resp = router.oneshot(transcription_req(&b, body)).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        // every failed attempt is recorded, including the final upstream
-        assert_eq!(fell_through(&state, &down1), 1);
-        assert_eq!(fell_through(&state, &down2), 1);
+        let ft1 = fell
+            .stt_upstream_attempts
+            .get_or_create(&metrics::stt_upstream_labels(&down1, "fell_through"))
+            .get();
+        let ft2 = fell
+            .stt_upstream_attempts
+            .get_or_create(&metrics::stt_upstream_labels(&down2, "fell_through"))
+            .get();
+        assert_eq!(ft1, 1);
+        assert_eq!(ft2, 1);
     }
 
     #[tokio::test]
-    async fn passthrough_503_is_not_failed_over() {
+    async fn transcription_503_is_not_failed_over() {
         let (busy, busy_recv) = spawn_mock(503).await;
         let (backup, backup_recv) = spawn_mock(200).await;
-        let state = app_state(vec![busy.clone(), backup.clone()]);
+        let state = asr_state(vec![busy.clone(), backup.clone()]);
+        let router = test_router(state);
 
-        let resp = passthrough_transcriptions(
-            &state,
-            Method::POST,
-            None,
-            &HeaderMap::new(),
-            Bytes::from_static(&[0u8; 64]),
-        )
-        .await;
+        let (b, body) = wav_multipart();
+        let resp = router.oneshot(transcription_req(&b, body)).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(busy_recv.load(Ordering::SeqCst) > 0);
@@ -586,33 +523,26 @@ mod passthrough_failover_tests {
     }
 
     #[tokio::test]
-    async fn passthrough_reorders_when_primary_marked_down() {
-        // Snapshot marks the primary unreachable and the failover reachable →
-        // the passthrough must hit the failover first and never attempt the
-        // (closed) primary, so no fell_through is recorded for it.
+    async fn transcription_reorders_when_primary_marked_down() {
         let primary = closed_addr().await;
         let (failover, received) = spawn_mock(200).await;
         let state =
-            app_state_with_reachability(vec![primary.clone(), failover.clone()], &[false, true]);
+            asr_state_with_reachability(vec![primary.clone(), failover.clone()], &[false, true]);
+        let fell = state.metrics.clone();
+        let router = test_router(state);
 
-        let resp = passthrough_transcriptions(
-            &state,
-            Method::POST,
-            None,
-            &HeaderMap::new(),
-            Bytes::from_static(&[3u8; 900]),
-        )
-        .await;
+        let (b, body) = wav_multipart();
+        let resp = router.oneshot(transcription_req(&b, body)).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            received.load(Ordering::SeqCst) >= 900,
-            "reordered failover received the full body"
+            received.load(Ordering::SeqCst) > 0,
+            "reordered failover received the request"
         );
-        assert_eq!(
-            fell_through(&state, &primary),
-            0,
-            "down primary must not be contacted"
-        );
+        let ft = fell
+            .stt_upstream_attempts
+            .get_or_create(&metrics::stt_upstream_labels(&primary, "fell_through"))
+            .get();
+        assert_eq!(ft, 0, "down primary must not be contacted");
     }
 }

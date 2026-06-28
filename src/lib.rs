@@ -5,3 +5,6 @@ pub mod metrics;
 pub mod node_state;
 pub mod proxy;
 pub mod wyoming;
+
+#[cfg(test)]
+pub mod test_util;
